@@ -4,11 +4,13 @@ import xml.etree.ElementTree as ET
 from tools.kdenlive_face_mask import (
     MASK_EFFECT_ID,
     FaceTrack,
+    MaskFrame,
     TrackSample,
     map_clip_frame_to_source_frame,
     resolve_scene_context,
     rewrite_scene_with_tracks,
     smooth_track,
+    thin_mask_frames,
 )
 
 
@@ -273,6 +275,80 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
         self.assertEqual(1, len(video_clip.findall("./effects/effect")))
         self.assertEqual(0, len(audio_clip.findall("./effects/effect")))
         self.assertEqual(MASK_EFFECT_ID, video_clip.find("./effects/effect").attrib.get("id"))
+
+    def test_fixed_keyframe_fps_reduces_serialized_keyframes(self) -> None:
+        rewritten = rewrite_scene_with_tracks(
+            SCENE_XML,
+            [make_track(12, range(0, 8), 420.0)],
+            frame_width=1920,
+            frame_height=1080,
+            shape=0.38,
+            tilt=0.5,
+            replace_existing_masks=True,
+            keyframe_fps=15.0,
+        )
+
+        root = ET.fromstring(rewritten)
+        effect = root.find("./clip[@id='15']/effects/effect")
+        self.assertIsNotNone(effect)
+        size_x = effect.find("./property[@name='filter.Size X']")
+        self.assertIsNotNone(size_x)
+        self.assertEqual("0=0;1=0.0197917;5=0.0197917;7=0.0197917;8=0", size_x.text)
+
+
+class KeyframeDensityTests(unittest.TestCase):
+    @staticmethod
+    def make_frames(indices: range, *, start_zero: bool = True, end_zero_frame: int | None = None, step: float = 0.002) -> list[MaskFrame]:
+        frames: list[MaskFrame] = []
+        if start_zero:
+            frames.append(MaskFrame(0, 0.5, 0.5, 0.0, 0.0))
+        for offset, frame_index in enumerate(indices, start=1):
+            frames.append(MaskFrame(frame_index, 0.5 + offset * step, 0.4, 0.02, 0.04))
+        if end_zero_frame is not None:
+            frames.append(MaskFrame(end_zero_frame, 0.5 + (len(indices) + 1) * step, 0.4, 0.0, 0.0))
+        return frames
+
+    def test_fixed_keyframe_fps_preserves_zero_size_anchors(self) -> None:
+        frames = self.make_frames(range(1, 6), end_zero_frame=6)
+
+        thinned = thin_mask_frames(
+            frames,
+            clip_fps=60.0,
+            keyframe_fps=15.0,
+            adaptive_keyframes=False,
+            min_keyframe_fps=12.0,
+            max_keyframe_fps=0.0,
+        )
+
+        self.assertEqual([0, 1, 5, 6], [frame.frame_index for frame in thinned])
+
+    def test_adaptive_keyframes_keep_fast_motion_denser_than_slow_motion(self) -> None:
+        slow_frames = self.make_frames(range(1, 7), end_zero_frame=7, step=0.0002)
+        fast_frames = self.make_frames(range(1, 7), end_zero_frame=7, step=0.02)
+
+        slow = thin_mask_frames(
+            slow_frames,
+            clip_fps=60.0,
+            keyframe_fps=0.0,
+            adaptive_keyframes=True,
+            min_keyframe_fps=15.0,
+            max_keyframe_fps=60.0,
+        )
+        fast = thin_mask_frames(
+            fast_frames,
+            clip_fps=60.0,
+            keyframe_fps=0.0,
+            adaptive_keyframes=True,
+            min_keyframe_fps=15.0,
+            max_keyframe_fps=60.0,
+        )
+
+        slow_visible_count = sum(1 for frame in slow if frame.size_x > 0.0)
+        fast_visible_count = sum(1 for frame in fast if frame.size_x > 0.0)
+
+        self.assertLess(slow_visible_count, fast_visible_count)
+        self.assertEqual([0, 7], [frame.frame_index for frame in slow if frame.size_x == 0.0])
+        self.assertEqual([0, 7], [frame.frame_index for frame in fast if frame.size_x == 0.0])
 
 
 class SmoothTrackTests(unittest.TestCase):

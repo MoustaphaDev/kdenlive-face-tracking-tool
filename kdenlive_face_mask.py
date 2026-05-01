@@ -18,6 +18,9 @@ MASK_EFFECT_ID = "mask_start-frei0r.alphaspot"
 DEFAULT_SHAPE = 0.38
 DEFAULT_TILT = 0.5
 DEFAULT_PROGRESS_EVERY = 120
+DEFAULT_MIN_KEYFRAME_FPS = 12.0
+ADAPTIVE_KEYFRAME_MOTION_RATIO_LOW = 0.012
+ADAPTIVE_KEYFRAME_MOTION_RATIO_HIGH = 0.05
 MODERATE_POSITION_MOTION_RATIO = 0.06
 FAST_POSITION_MOTION_RATIO = 0.12
 
@@ -193,6 +196,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=2,
         help="Radius of the temporal smoothing window applied to each track.",
+    )
+    parser.add_argument(
+        "--keyframe-fps",
+        type=float,
+        default=0.0,
+        help="Limit emitted Kdenlive keyframes to approximately this FPS. 0 keeps one keyframe per tracked frame.",
+    )
+    parser.add_argument(
+        "--adaptive-keyframes",
+        action="store_true",
+        help="Vary emitted keyframe density by motion speed while preserving full-rate tracking internally.",
+    )
+    parser.add_argument(
+        "--min-keyframe-fps",
+        type=float,
+        default=DEFAULT_MIN_KEYFRAME_FPS,
+        help="Minimum emitted keyframe FPS when adaptive keyframes are enabled.",
+    )
+    parser.add_argument(
+        "--max-keyframe-fps",
+        type=float,
+        default=0.0,
+        help="Maximum emitted keyframe FPS when adaptive keyframes are enabled. 0 uses the clip FPS.",
     )
     parser.add_argument(
         "--shape",
@@ -778,6 +804,142 @@ def merge_disjoint_tracks(tracks: Sequence[FaceTrack]) -> list[FaceTrack]:
     return merged_tracks
 
 
+def is_zero_size_mask_frame(frame: MaskFrame) -> bool:
+    return frame.size_x == 0.0 and frame.size_y == 0.0
+
+
+def split_visible_mask_segments(frames: Sequence[MaskFrame]) -> list[list[MaskFrame]]:
+    segments: list[list[MaskFrame]] = []
+    current_segment: list[MaskFrame] = []
+    for frame in frames:
+        if is_zero_size_mask_frame(frame):
+            if current_segment:
+                segments.append(current_segment)
+                current_segment = []
+            continue
+        current_segment.append(frame)
+    if current_segment:
+        segments.append(current_segment)
+    return segments
+
+
+def mask_frame_motion_ratio(left: MaskFrame, right: MaskFrame) -> float:
+    delta_position = math.hypot(right.pos_x - left.pos_x, right.pos_y - left.pos_y)
+    delta_size = math.hypot(right.size_x - left.size_x, right.size_y - left.size_y)
+    scale = max(math.hypot(left.size_x * 2.0, left.size_y * 2.0), math.hypot(right.size_x * 2.0, right.size_y * 2.0), 1e-6)
+    return (delta_position + 0.5 * delta_size) / scale
+
+
+def compute_segment_motion_ratios(segment: Sequence[MaskFrame]) -> list[float]:
+    if len(segment) <= 1:
+        return [1.0] * len(segment)
+
+    motion_ratios = [0.0] * len(segment)
+    for index in range(1, len(segment)):
+        ratio = mask_frame_motion_ratio(segment[index - 1], segment[index])
+        motion_ratios[index - 1] = max(motion_ratios[index - 1], ratio)
+        motion_ratios[index] = max(motion_ratios[index], ratio)
+    return motion_ratios
+
+
+def resolve_target_keyframe_fps(target_fps: float, clip_fps: float) -> float:
+    if target_fps <= 0.0:
+        return clip_fps
+    return min(target_fps, clip_fps)
+
+
+def keyframe_interval_frames(clip_fps: float, target_fps: float) -> float:
+    resolved_fps = resolve_target_keyframe_fps(target_fps, clip_fps)
+    if resolved_fps <= 0.0:
+        return 1.0
+    return max(1.0, clip_fps / resolved_fps)
+
+
+def adaptive_target_keyframe_fps(motion_ratio: float, clip_fps: float, min_keyframe_fps: float, max_keyframe_fps: float) -> float:
+    resolved_max_fps = resolve_target_keyframe_fps(max_keyframe_fps, clip_fps)
+    resolved_min_fps = max(1.0, min(min_keyframe_fps, resolved_max_fps))
+    if resolved_min_fps >= resolved_max_fps:
+        return resolved_max_fps
+
+    normalized_motion = (motion_ratio - ADAPTIVE_KEYFRAME_MOTION_RATIO_LOW) / max(
+        ADAPTIVE_KEYFRAME_MOTION_RATIO_HIGH - ADAPTIVE_KEYFRAME_MOTION_RATIO_LOW,
+        1e-6,
+    )
+    normalized_motion = min(max(normalized_motion, 0.0), 1.0)
+    return resolved_min_fps + normalized_motion * (resolved_max_fps - resolved_min_fps)
+
+
+def select_segment_keyframes(
+    segment: Sequence[MaskFrame],
+    *,
+    clip_fps: float,
+    keyframe_fps: float,
+    adaptive_keyframes: bool,
+    min_keyframe_fps: float,
+    max_keyframe_fps: float,
+) -> list[MaskFrame]:
+    if len(segment) <= 2 or clip_fps <= 0.0:
+        return list(segment)
+
+    if not adaptive_keyframes and (keyframe_fps <= 0.0 or keyframe_fps >= clip_fps):
+        return list(segment)
+
+    motion_ratios = compute_segment_motion_ratios(segment)
+    selected_frames = [segment[0]]
+    last_kept_frame_index = segment[0].frame_index
+
+    for index, frame in enumerate(segment[1:-1], start=1):
+        if adaptive_keyframes:
+            interval = keyframe_interval_frames(
+                clip_fps,
+                adaptive_target_keyframe_fps(motion_ratios[index], clip_fps, min_keyframe_fps, max_keyframe_fps),
+            )
+        else:
+            interval = keyframe_interval_frames(clip_fps, keyframe_fps)
+
+        if frame.frame_index >= last_kept_frame_index + interval - 1e-9:
+            selected_frames.append(frame)
+            last_kept_frame_index = frame.frame_index
+
+    if selected_frames[-1].frame_index != segment[-1].frame_index:
+        selected_frames.append(segment[-1])
+    return selected_frames
+
+
+def thin_mask_frames(
+    frames: Sequence[MaskFrame],
+    *,
+    clip_fps: float,
+    keyframe_fps: float,
+    adaptive_keyframes: bool,
+    min_keyframe_fps: float,
+    max_keyframe_fps: float,
+) -> list[MaskFrame]:
+    if not frames:
+        return []
+
+    effective_keyframe_fps = resolve_target_keyframe_fps(keyframe_fps, clip_fps)
+    effective_max_keyframe_fps = resolve_target_keyframe_fps(max_keyframe_fps, clip_fps)
+    if not adaptive_keyframes and (effective_keyframe_fps >= clip_fps or keyframe_fps <= 0.0):
+        return list(frames)
+    if adaptive_keyframes and max(1.0, min_keyframe_fps) >= effective_max_keyframe_fps >= clip_fps:
+        return list(frames)
+
+    selected_visible_frame_indices: set[int] = set()
+    for segment in split_visible_mask_segments(frames):
+        for frame in select_segment_keyframes(
+            segment,
+            clip_fps=clip_fps,
+            keyframe_fps=effective_keyframe_fps,
+            adaptive_keyframes=adaptive_keyframes,
+            min_keyframe_fps=min_keyframe_fps,
+            max_keyframe_fps=effective_max_keyframe_fps,
+        ):
+            selected_visible_frame_indices.add(frame.frame_index)
+
+    return [frame for frame in frames if is_zero_size_mask_frame(frame) or frame.frame_index in selected_visible_frame_indices]
+
+
 def build_keyframe_string(frames: Sequence[MaskFrame], selector) -> str:
     return ";".join(f"{frame.frame_index}={format_float(selector(frame))}" for frame in frames)
 
@@ -792,9 +954,28 @@ def make_property(name: str, value: str) -> ET.Element:
     return prop
 
 
-def make_mask_effect(track: FaceTrack, total_frames: int, frame_width: int, frame_height: int, shape: float, tilt: float) -> ET.Element:
+def make_mask_effect(
+    track: FaceTrack,
+    total_frames: int,
+    frame_width: int,
+    frame_height: int,
+    clip_fps: float,
+    shape: float,
+    tilt: float,
+    keyframe_fps: float,
+    adaptive_keyframes: bool,
+    min_keyframe_fps: float,
+    max_keyframe_fps: float,
+) -> ET.Element:
     effect = ET.Element("effect", {"id": MASK_EFFECT_ID})
-    frames = build_mask_frames(track, total_frames, frame_width, frame_height)
+    frames = thin_mask_frames(
+        build_mask_frames(track, total_frames, frame_width, frame_height),
+        clip_fps=clip_fps,
+        keyframe_fps=keyframe_fps,
+        adaptive_keyframes=adaptive_keyframes,
+        min_keyframe_fps=min_keyframe_fps,
+        max_keyframe_fps=max_keyframe_fps,
+    )
     effect.append(make_property("kdenlive:collapsed", "1"))
     effect.append(make_property("filter.Min", build_constant_keyframe_string(frames, 0.0)))
     effect.append(make_property("filter.Transition width", build_constant_keyframe_string(frames, 0.0)))
@@ -825,6 +1006,10 @@ def rewrite_scene_with_tracks(
     shape: float,
     tilt: float,
     replace_existing_masks: bool = True,
+    keyframe_fps: float = 0.0,
+    adaptive_keyframes: bool = False,
+    min_keyframe_fps: float = DEFAULT_MIN_KEYFRAME_FPS,
+    max_keyframe_fps: float = 0.0,
 ) -> str:
     if not tracks:
         raise ValueError("No face tracks were generated for this clip")
@@ -838,7 +1023,21 @@ def rewrite_scene_with_tracks(
                 effects.remove(effect)
 
     for track in merged_tracks:
-        effects.append(make_mask_effect(track, context.total_frames, frame_width, frame_height, shape, tilt))
+        effects.append(
+            make_mask_effect(
+                track,
+                context.total_frames,
+                frame_width,
+                frame_height,
+                context.fps,
+                shape,
+                tilt,
+                keyframe_fps,
+                adaptive_keyframes,
+                min_keyframe_fps,
+                max_keyframe_fps,
+            )
+        )
 
     ET.indent(context.root, space=" ")
     return ET.tostring(context.root, encoding="unicode")
@@ -973,6 +1172,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             shape=args.shape,
             tilt=args.tilt,
             replace_existing_masks=not args.keep_existing_masks,
+            keyframe_fps=args.keyframe_fps,
+            adaptive_keyframes=args.adaptive_keyframes,
+            min_keyframe_fps=args.min_keyframe_fps,
+            max_keyframe_fps=args.max_keyframe_fps,
         )
         write_text_output(output_text, args)
     except Exception as exc:

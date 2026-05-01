@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import math
 import shutil
@@ -21,6 +22,8 @@ DEFAULT_PROGRESS_EVERY = 120
 DEFAULT_MIN_KEYFRAME_FPS = 12.0
 ADAPTIVE_KEYFRAME_MOTION_RATIO_LOW = 0.012
 ADAPTIVE_KEYFRAME_MOTION_RATIO_HIGH = 0.05
+MASK_OPERATION_WRITE_ON_CLEAR = "0"
+MASK_OPERATION_MAX = "0.3"
 MODERATE_POSITION_MOTION_RATIO = 0.06
 FAST_POSITION_MOTION_RATIO = 0.12
 
@@ -594,9 +597,12 @@ def build_detector(det_size: tuple[int, int], model_name: str, provider_mode: st
     last_error: Exception | None = None
     for providers in provider_sets:
         try:
-            app = FaceAnalysis(name=model_name, allowed_modules=["detection"], providers=providers)
-            app.prepare(ctx_id=0, det_size=det_size)
-            app.get(np.zeros((360, 640, 3), dtype=np.uint8))
+            # InsightFace and ONNX Runtime can print provider/model messages to stdout
+            # during initialization. Redirect them to stderr so rewritten XML stdout stays clean.
+            with contextlib.redirect_stdout(sys.stderr):
+                app = FaceAnalysis(name=model_name, allowed_modules=["detection"], providers=providers)
+                app.prepare(ctx_id=0, det_size=det_size)
+                app.get(np.zeros((360, 640, 3), dtype=np.uint8))
             return app, providers, cv2
         except Exception as exc:  # pragma: no cover - hardware/provider dependent
             last_error = exc
@@ -754,9 +760,6 @@ def build_mask_frames(track: FaceTrack, total_frames: int, frame_width: int, fra
             segments.append([frame_index])
 
     frames: dict[int, MaskFrame] = {}
-    first_segment_start = segments[0][0]
-    if first_segment_start > 0:
-        frames[0] = normalized(sample_by_frame[first_segment_start], frame_index=0, zero_size=True)
 
     for segment in segments:
         segment_start = segment[0]
@@ -962,6 +965,7 @@ def make_mask_effect(
     clip_fps: float,
     shape: float,
     tilt: float,
+    operation: str,
     keyframe_fps: float,
     adaptive_keyframes: bool,
     min_keyframe_fps: float,
@@ -986,7 +990,7 @@ def make_mask_effect(
     effect.append(make_property("filter.Position Y", build_keyframe_string(frames, lambda item: item.pos_y)))
     effect.append(make_property("filter.Position X", build_keyframe_string(frames, lambda item: item.pos_x)))
     effect.append(make_property("filter.Shape", format_float(shape)))
-    effect.append(make_property("filter.Operation", "0"))
+    effect.append(make_property("filter.Operation", operation))
     return effect
 
 
@@ -1022,7 +1026,7 @@ def rewrite_scene_with_tracks(
             if effect.tag == "effect" and effect.attrib.get("id") == MASK_EFFECT_ID:
                 effects.remove(effect)
 
-    for track in merged_tracks:
+    for index, track in enumerate(merged_tracks):
         effects.append(
             make_mask_effect(
                 track,
@@ -1032,6 +1036,7 @@ def rewrite_scene_with_tracks(
                 context.fps,
                 shape,
                 tilt,
+                MASK_OPERATION_WRITE_ON_CLEAR if index == 0 else MASK_OPERATION_MAX,
                 keyframe_fps,
                 adaptive_keyframes,
                 min_keyframe_fps,

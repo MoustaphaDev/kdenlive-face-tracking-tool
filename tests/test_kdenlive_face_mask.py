@@ -1,11 +1,15 @@
+import contextlib
+import io
 import unittest
 import xml.etree.ElementTree as ET
+from unittest.mock import patch
 
 from tools.kdenlive_face_mask import (
     MASK_EFFECT_ID,
     FaceTrack,
     MaskFrame,
     TrackSample,
+    build_detector,
     map_clip_frame_to_source_frame,
     resolve_scene_context,
     rewrite_scene_with_tracks,
@@ -146,6 +150,54 @@ class SourceFrameMappingTests(unittest.TestCase):
         self.assertEqual(436, map_clip_frame_to_source_frame(875, 60.0, 29.97, 436))
 
 
+class DetectorInitializationTests(unittest.TestCase):
+    def test_build_detector_redirects_third_party_stdout_to_stderr(self) -> None:
+        class FakeOrt:
+            @staticmethod
+            def get_available_providers():
+                return ["ROCMExecutionProvider", "CPUExecutionProvider"]
+
+        class FakeNP:
+            uint8 = object()
+
+            @staticmethod
+            def zeros(_shape, dtype=None):
+                return {"dtype": dtype}
+
+        class FakeFaceAnalysis:
+            def __init__(self, *, name, allowed_modules, providers):
+                print(f"Applied providers: {providers}")
+                self.name = name
+                self.allowed_modules = allowed_modules
+                self.providers = providers
+
+            def prepare(self, *, ctx_id, det_size):
+                print(f"set det-size: {det_size}")
+                self.ctx_id = ctx_id
+                self.det_size = det_size
+
+            def get(self, _frame):
+                print("model ignore: fake-model")
+                return []
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch(
+            "tools.kdenlive_face_mask._import_detection_modules",
+            return_value=("fake-cv2", FakeNP(), FakeOrt(), FakeFaceAnalysis),
+        ):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "rocm")
+
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("Applied providers:", stderr.getvalue())
+        self.assertIn("set det-size:", stderr.getvalue())
+        self.assertIn("model ignore:", stderr.getvalue())
+        self.assertEqual(["ROCMExecutionProvider", "CPUExecutionProvider"], providers)
+        self.assertEqual("fake-cv2", cv2)
+        self.assertIsInstance(detector, FakeFaceAnalysis)
+
+
 class RewriteSceneWithTracksTests(unittest.TestCase):
     def test_replaces_existing_mask_effects(self) -> None:
         rewritten = rewrite_scene_with_tracks(
@@ -180,6 +232,9 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
         effects = root.findall("./clip[@id='15']/effects/effect")
         self.assertEqual(2, len(effects))
 
+        operations = [effect.find("./property[@name='filter.Operation']").text for effect in effects]
+        self.assertEqual(["0", "0.3"], operations)
+
     def test_zero_sizes_are_inserted_outside_track_span(self) -> None:
         rewritten = rewrite_scene_with_tracks(
             SCENE_XML,
@@ -196,7 +251,7 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
-        self.assertEqual("0=0;9=0;10=0.0197917;11=0.0197917;12=0.0197917;13=0", size_x.text)
+        self.assertEqual("9=0;10=0.0197917;11=0.0197917;12=0.0197917;13=0", size_x.text)
 
     def test_mask_keyframes_stay_local_to_track_span(self) -> None:
         rewritten = rewrite_scene_with_tracks(
@@ -220,7 +275,7 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
             size_x.text,
         )
 
-    def test_non_zero_start_track_keeps_frame_zero_anchor(self) -> None:
+    def test_non_zero_start_track_uses_pre_segment_zero_anchor_only(self) -> None:
         rewritten = rewrite_scene_with_tracks(
             SCENE_XML,
             [make_track(11, range(8, 12), 700.0)],
@@ -236,7 +291,7 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
-        self.assertEqual("0=0;7=0;8=0.0197917;9=0.0197917;10=0.0197917;11=0.0197917;12=0", size_x.text)
+        self.assertEqual("7=0;8=0.0197917;9=0.0197917;10=0.0197917;11=0.0197917;12=0", size_x.text)
 
     def test_start_of_clip_track_begins_with_zero_size_keyframe(self) -> None:
         rewritten = rewrite_scene_with_tracks(

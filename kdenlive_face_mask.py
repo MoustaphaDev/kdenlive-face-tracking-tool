@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import heapq
 import logging
 import math
 import shutil
@@ -790,19 +791,23 @@ def merge_disjoint_tracks(tracks: Sequence[FaceTrack]) -> list[FaceTrack]:
     if not tracks:
         return []
 
+    # Reuse mask effects as an interval-partitioning problem so the number of
+    # generated effects equals the peak number of simultaneously visible faces.
     merged_tracks: list[FaceTrack] = []
+    active_slots: list[tuple[int, int]] = []
     sorted_tracks = sorted(tracks, key=lambda track: (track.first_frame(), track.last_frame(), track.average_cx(), track.track_id))
     for track in sorted_tracks:
-        if not merged_tracks:
-            merged_tracks.append(FaceTrack(track_id=track.track_id, samples=list(track.samples)))
-            continue
+        assigned_slot: int | None = None
+        if active_slots and active_slots[0][0] < track.first_frame():
+            _, assigned_slot = heapq.heappop(active_slots)
 
-        previous = merged_tracks[-1]
-        if track.first_frame() > previous.last_frame():
-            previous.samples.extend(track.samples)
-            continue
+        if assigned_slot is None:
+            assigned_slot = len(merged_tracks)
+            merged_tracks.append(FaceTrack(track_id=assigned_slot + 1, samples=list(track.samples)))
+        else:
+            merged_tracks[assigned_slot].samples.extend(track.samples)
 
-        merged_tracks.append(FaceTrack(track_id=track.track_id, samples=list(track.samples)))
+        heapq.heappush(active_slots, (track.last_frame(), assigned_slot))
 
     return merged_tracks
 

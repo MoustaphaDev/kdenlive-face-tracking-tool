@@ -235,6 +235,25 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
         operations = [effect.find("./property[@name='filter.Operation']").text for effect in effects]
         self.assertEqual(["0", "0.3"], operations)
 
+    def test_effect_count_matches_peak_concurrent_tracks(self) -> None:
+        rewritten = rewrite_scene_with_tracks(
+            SCENE_XML,
+            [
+                make_track(1, range(0, 2), 300.0),
+                make_track(2, range(0, 11), 700.0),
+                make_track(3, range(2, 4), 500.0),
+            ],
+            frame_width=1920,
+            frame_height=1080,
+            shape=0.38,
+            tilt=0.5,
+            replace_existing_masks=True,
+        )
+
+        root = ET.fromstring(rewritten)
+        effects = root.findall("./clip[@id='15']/effects/effect")
+        self.assertEqual(2, len(effects))
+
     def test_zero_sizes_are_inserted_outside_track_span(self) -> None:
         rewritten = rewrite_scene_with_tracks(
             SCENE_XML,

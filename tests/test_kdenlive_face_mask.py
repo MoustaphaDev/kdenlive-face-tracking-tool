@@ -4,7 +4,7 @@ import unittest
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
-from tools.kdenlive_face_mask import (
+from kdenlive_face_mask import (
     MASK_EFFECT_ID,
     FaceTrack,
     MaskFrame,
@@ -151,6 +151,42 @@ class SourceFrameMappingTests(unittest.TestCase):
 
 
 class DetectorInitializationTests(unittest.TestCase):
+    def test_build_detector_prefers_cuda_in_auto_mode(self) -> None:
+        class FakeOrt:
+            @staticmethod
+            def get_available_providers():
+                return ["CPUExecutionProvider", "ROCMExecutionProvider", "CUDAExecutionProvider"]
+
+        class FakeNP:
+            uint8 = object()
+
+            @staticmethod
+            def zeros(_shape, dtype=None):
+                return {"dtype": dtype}
+
+        class FakeFaceAnalysis:
+            def __init__(self, *, name, allowed_modules, providers):
+                self.name = name
+                self.allowed_modules = allowed_modules
+                self.providers = providers
+
+            def prepare(self, *, ctx_id, det_size):
+                self.ctx_id = ctx_id
+                self.det_size = det_size
+
+            def get(self, _frame):
+                return []
+
+        with patch(
+            "kdenlive_face_mask._import_detection_modules",
+            return_value=("fake-cv2", FakeNP(), FakeOrt(), FakeFaceAnalysis),
+        ):
+            detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "auto")
+
+        self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], providers)
+        self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], detector.providers)
+        self.assertEqual("fake-cv2", cv2)
+
     def test_build_detector_redirects_third_party_stdout_to_stderr(self) -> None:
         class FakeOrt:
             @staticmethod
@@ -183,7 +219,7 @@ class DetectorInitializationTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with patch(
-            "tools.kdenlive_face_mask._import_detection_modules",
+            "kdenlive_face_mask._import_detection_modules",
             return_value=("fake-cv2", FakeNP(), FakeOrt(), FakeFaceAnalysis),
         ):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -196,6 +232,40 @@ class DetectorInitializationTests(unittest.TestCase):
         self.assertEqual(["ROCMExecutionProvider", "CPUExecutionProvider"], providers)
         self.assertEqual("fake-cv2", cv2)
         self.assertIsInstance(detector, FakeFaceAnalysis)
+
+    def test_build_detector_uses_cuda_mode_when_available(self) -> None:
+        class FakeOrt:
+            @staticmethod
+            def get_available_providers():
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        class FakeNP:
+            uint8 = object()
+
+            @staticmethod
+            def zeros(_shape, dtype=None):
+                return {"dtype": dtype}
+
+        class FakeFaceAnalysis:
+            def __init__(self, *, name, allowed_modules, providers):
+                self.providers = providers
+
+            def prepare(self, *, ctx_id, det_size):
+                self.ctx_id = ctx_id
+                self.det_size = det_size
+
+            def get(self, _frame):
+                return []
+
+        with patch(
+            "kdenlive_face_mask._import_detection_modules",
+            return_value=("fake-cv2", FakeNP(), FakeOrt(), FakeFaceAnalysis),
+        ):
+            detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "cuda")
+
+        self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], providers)
+        self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], detector.providers)
+        self.assertEqual("fake-cv2", cv2)
 
 
 class RewriteSceneWithTracksTests(unittest.TestCase):

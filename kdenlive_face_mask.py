@@ -171,8 +171,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--provider-mode",
         default="auto",
-        choices=("auto", "rocm", "migraphx", "cpu"),
-        help="ONNX Runtime provider preference. auto tries ROCm first, then CPU.",
+        choices=("auto", "cuda", "rocm", "migraphx", "cpu"),
+        help="ONNX Runtime provider preference. auto tries CUDA, then ROCm, then CPU.",
     )
     parser.add_argument(
         "--det-size",
@@ -579,8 +579,14 @@ def build_detector(det_size: tuple[int, int], model_name: str, provider_mode: st
     provider_sets: list[list[str]] = []
 
     if provider_mode == "auto":
+        if "CUDAExecutionProvider" in available:
+            provider_sets.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
         if "ROCMExecutionProvider" in available:
             provider_sets.append(["ROCMExecutionProvider", "CPUExecutionProvider"])
+        provider_sets.append(["CPUExecutionProvider"])
+    elif provider_mode == "cuda":
+        if "CUDAExecutionProvider" in available:
+            provider_sets.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
         provider_sets.append(["CPUExecutionProvider"])
     elif provider_mode == "rocm":
         if "ROCMExecutionProvider" in available:

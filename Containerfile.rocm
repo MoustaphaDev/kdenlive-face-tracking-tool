@@ -1,0 +1,39 @@
+FROM docker.io/rocm/dev-ubuntu-24.04:6.4.4
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VIRTUAL_ENV=/opt/kdenlive-tool-venv \
+    PATH=/opt/kdenlive-tool-venv/bin:$PATH \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    hipblas \
+    hipfft \
+    libglib2.0-0 \
+    libgomp1 \
+    miopen-hip \
+    python3 \
+    python3-venv \
+    rocblas \
+    && find /opt/rocm/lib/rocblas/library -type f -name '*gfx*' \
+        ! \( -name '*gfx1100*' -o -name '*gfx1101*' -o -name '*gfx1102*' -o -name '*gfx1103*' \) -delete \
+    && find /opt/rocm/lib/hipblaslt/library -type f -name '*gfx*' \
+        ! \( -name '*gfx1100*' -o -name '*gfx1101*' -o -name '*gfx1102*' -o -name '*gfx1103*' \) -delete \
+    && find /opt/rocm/share/miopen/db -type f -name 'gfx*' \
+        ! \( -name 'gfx1100*' -o -name 'gfx1101*' -o -name 'gfx1102*' -o -name 'gfx1103*' \) -delete \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies directly in the image.
+RUN python3 -m venv "$VIRTUAL_ENV" \
+    && pip install --upgrade pip setuptools wheel \
+    && pip install \
+        insightface==0.7.3 \
+        numpy>=2.2.2 \
+        onnxruntime-rocm==1.22.2.post1 \
+        opencv-python-headless==4.10.0.84
+
+WORKDIR /workspace
+
+ENTRYPOINT ["python", "-u", "kdenlive_face_mask.py"]

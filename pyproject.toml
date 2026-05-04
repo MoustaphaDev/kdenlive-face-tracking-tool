@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kdenlive-face-tracking-tool"
 version = "0.1.0"
-description = "Offline Kdenlive face-tracking mask generator with a CPU-first workflow and optional CUDA, ROCm, CoreML, and OpenVINO acceleration where host runtimes support it"
+description = "Automate face-mask tracking in Kdenlive by generating ready-to-paste Alpha shapes keyframes from copied clip XML"
 license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.12"

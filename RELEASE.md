@@ -6,7 +6,7 @@ Use this checklist before publishing a GitHub release and sharing the repo publi
 
 - [ ] Confirm release scope and changelog notes.
 - [ ] Bump `version` in `pyproject.toml`.
-- [ ] Ensure README examples match current CLI flags and defaults.
+- [ ] Ensure README and docs examples match current CLI flags and defaults.
 
 ## 2) Local Validation
 

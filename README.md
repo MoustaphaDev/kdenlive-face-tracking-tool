@@ -12,7 +12,7 @@ Real-world validation so far is limited to one Arch Linux machine with an AMD 87
 
 ## Demo
 
-<video src="./media/demo.mp4" controls muted playsinline loop></video>
+<video src="https://github.com/user-attachments/assets/97a6f378-7bf9-4b73-8050-744ca8ee8d22" controls muted playsinline loop></video>
 
 If the embedded player does not render in your viewer, open [media/demo.mp4](media/demo.mp4) directly.
 

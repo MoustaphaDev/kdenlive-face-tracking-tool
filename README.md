@@ -2,11 +2,13 @@
 
 Automate face-mask tracking in Kdenlive so you spend less time keyframing by hand.
 
-If Kdenlive's built-in tracking does not stay glued to faces well enough for your footage, or manual masking would take forever, this tool gives you a fast first pass. It generates tracked `Alpha shapes (Mask)` effects from copied clip XML so you can polish a few misses instead of animating every face from scratch.
+If Kdenlive's built-in motion tracking does not stay glued to faces well enough for your footage, or manual masking would take forever, this tool gives you a fast first pass. It generates tracked `Alpha shapes (Mask)` effects from copied clip XML so you can polish a few misses instead of animating every face from scratch.
 
-The workflow is intentionally simple: copy a clip in Kdenlive, run the tool, paste the generated effects back, then add blur, pixelize, or another censor effect below the masks. Under the hood it runs InsightFace offline over the clip frames, calculates smoothed mask coordinates, and rewrites the copied XML for you.
+The workflow is intentionally simple: copy a clip in Kdenlive, run the tool on that copied XML, paste the generated effects back, then add blur, pixelize, or another censor effect below the masks. Under the hood it runs InsightFace offline over the clip frames, calculates smoothed mask coordinates, and rewrites the copied XML for you.
 
-Targets Linux, macOS, and Windows, with CPU as the default path and optional CUDA, ROCm, CoreML, and OpenVINO providers where the host runtime stack supports them.
+Designed for Linux, macOS, and Windows, with CPU as the default path and optional CUDA, ROCm, CoreML, and OpenVINO providers where the host runtime stack supports them.
+
+Real-world validation so far is limited to one Arch Linux machine with an AMD 8745HS APU and the included ROCm container workflow. Other platforms and provider combinations should still be treated as expected-to-work rather than broadly validated.
 
 ## Demo
 
@@ -24,7 +26,7 @@ If the embedded player does not render in your viewer, open [media/demo.mp4](med
 ## Workflow
 
 1. Copy a clip in Kdenlive.
-2. Run `kdenlive-face-mask`; the default workflow reads the copied XML from your clipboard, tracks the faces, injects smoothed mask keyframes, and writes the rewritten XML back.
+2. Run `kdenlive-face-mask --clipboard-in --clipboard-out`; that clipboard workflow reads the copied XML, tracks the faces, injects smoothed mask keyframes, and writes the rewritten XML back to your clipboard.
 3. Paste the rewritten clip or effects back into Kdenlive, place your censor effect between the generated masks and `Mask Apply`, and keep editing.
 4. If one face drifts for a few frames, fix just those keyframes instead of building the whole mask animation by hand.
 
@@ -92,7 +94,9 @@ For multi-mask behavior, effect-stack tutorials, and example censor workflows, s
 
 This project was developed with substantial AI assistance, including architecture planning, Kdenlive XML analysis, iterative requirement refinement, code generation, and most of the documentation.
 
-The implementation has since been manually reviewed at a high level and tested in the environments documented here, but it has not been independently re-derived or exhaustively line-by-line audited.
+The implementation has since been manually reviewed at a high level, but it has not been independently re-derived or exhaustively line-by-line audited.
+
+Real-world testing so far is limited to my own machine, an AMD 8745HS APU system, plus the included ROCm container workflow. Broader platform and provider expectations are based on the implemented code paths, dependency support, and (not yet passing) CI smoke coverage rather than direct hands-on validation across every environment.
 
 </details>
 

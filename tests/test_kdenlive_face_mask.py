@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import builtins
+from typing import Sequence
 import unittest
 import unittest.mock
 import xml.etree.ElementTree as ET
@@ -15,9 +17,12 @@ from kdenlive_face_mask import (
     FaceTrack,
     MaskFrame,
     TrackSample,
+    build_mask_frames,
     build_detector,
+    detect_onnxruntime_support,
     main,
     map_clip_frame_to_source_frame,
+    probe_provider_mode,
     read_from_clipboard,
     resolve_scene_context,
     rewrite_scene_with_tracks,
@@ -162,6 +167,20 @@ def make_smoke_scene_xml(resource_path: str, *, frame_count: int, frame_width: i
 """
 
 
+def fake_provider_model(providers: Sequence[str]):
+    return type(
+        "FakeModel",
+        (),
+        {
+            "session": type(
+                "FakeSession",
+                (),
+                {"get_providers": lambda self: list(providers)},
+            )(),
+        },
+    )()
+
+
 class ResolveSceneContextTests(unittest.TestCase):
     def test_extracts_resource_and_frame_range(self) -> None:
         context = resolve_scene_context(SCENE_XML)
@@ -214,6 +233,23 @@ class RuntimeDependencySmokeTests(unittest.TestCase):
         self.assertTrue(hasattr(ort, "get_available_providers"))
 
 
+class RuntimeDependencyFailureTests(unittest.TestCase):
+    def test_detect_onnxruntime_support_reports_native_loader_failures(self) -> None:
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "onnxruntime":
+                raise OSError("missing libonnxruntime.so")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            support = detect_onnxruntime_support()
+
+        self.assertFalse(support["import_ok"])
+        self.assertIn("OSError", support["error"])
+        self.assertIn("missing libonnxruntime.so", support["error"])
+
+
 class DetectorInitializationTests(unittest.TestCase):
     def test_build_detector_prefers_cuda_in_auto_mode(self) -> None:
         class FakeOrt:
@@ -232,7 +268,7 @@ class DetectorInitializationTests(unittest.TestCase):
             def __init__(self, *, name, allowed_modules, providers):
                 self.name = name
                 self.allowed_modules = allowed_modules
-                self.providers = providers
+                self.models = {"detection": fake_provider_model(providers)}
 
             def prepare(self, *, ctx_id, det_size):
                 self.ctx_id = ctx_id
@@ -248,7 +284,7 @@ class DetectorInitializationTests(unittest.TestCase):
             detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "auto")
 
         self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], providers)
-        self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], detector.providers)
+        self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], detector.models["detection"].session.get_providers())
         self.assertEqual("fake-cv2", cv2)
 
     def test_build_detector_redirects_third_party_stdout_to_stderr(self) -> None:
@@ -269,7 +305,7 @@ class DetectorInitializationTests(unittest.TestCase):
                 print(f"Applied providers: {providers}")
                 self.name = name
                 self.allowed_modules = allowed_modules
-                self.providers = providers
+                self.models = {"detection": fake_provider_model(providers)}
 
             def prepare(self, *, ctx_id, det_size):
                 print(f"set det-size: {det_size}")
@@ -312,7 +348,7 @@ class DetectorInitializationTests(unittest.TestCase):
 
         class FakeFaceAnalysis:
             def __init__(self, *, name, allowed_modules, providers):
-                self.providers = providers
+                self.models = {"detection": fake_provider_model(providers)}
 
             def prepare(self, *, ctx_id, det_size):
                 self.ctx_id = ctx_id
@@ -328,7 +364,7 @@ class DetectorInitializationTests(unittest.TestCase):
             detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "cuda")
 
         self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], providers)
-        self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], detector.providers)
+        self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], detector.models["detection"].session.get_providers())
         self.assertEqual("fake-cv2", cv2)
 
     def test_build_detector_prefers_coreml_in_auto_mode_on_macos(self) -> None:
@@ -346,7 +382,7 @@ class DetectorInitializationTests(unittest.TestCase):
 
         class FakeFaceAnalysis:
             def __init__(self, *, name, allowed_modules, providers):
-                self.providers = providers
+                self.models = {"detection": fake_provider_model(providers)}
 
             def prepare(self, *, ctx_id, det_size):
                 pass
@@ -377,7 +413,7 @@ class DetectorInitializationTests(unittest.TestCase):
 
         class FakeFaceAnalysis:
             def __init__(self, *, name, allowed_modules, providers):
-                self.providers = providers
+                self.models = {"detection": fake_provider_model(providers)}
 
             def prepare(self, *, ctx_id, det_size):
                 pass
@@ -392,7 +428,7 @@ class DetectorInitializationTests(unittest.TestCase):
             detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "coreml")
 
         self.assertEqual(["CoreMLExecutionProvider", "CPUExecutionProvider"], providers)
-        self.assertEqual(["CoreMLExecutionProvider", "CPUExecutionProvider"], detector.providers)
+        self.assertEqual(["CoreMLExecutionProvider", "CPUExecutionProvider"], detector.models["detection"].session.get_providers())
 
     def test_build_detector_uses_openvino_mode_when_available(self) -> None:
         class FakeOrt:
@@ -409,7 +445,7 @@ class DetectorInitializationTests(unittest.TestCase):
 
         class FakeFaceAnalysis:
             def __init__(self, *, name, allowed_modules, providers):
-                self.providers = providers
+                self.models = {"detection": fake_provider_model(providers)}
 
             def prepare(self, *, ctx_id, det_size):
                 pass
@@ -424,7 +460,7 @@ class DetectorInitializationTests(unittest.TestCase):
             detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "openvino")
 
         self.assertEqual(["OpenVINOExecutionProvider", "CPUExecutionProvider"], providers)
-        self.assertEqual(["OpenVINOExecutionProvider", "CPUExecutionProvider"], detector.providers)
+        self.assertEqual(["OpenVINOExecutionProvider", "CPUExecutionProvider"], detector.models["detection"].session.get_providers())
 
     def test_build_detector_falls_back_to_cpu_when_coreml_unavailable(self) -> None:
         class FakeOrt:
@@ -441,7 +477,7 @@ class DetectorInitializationTests(unittest.TestCase):
 
         class FakeFaceAnalysis:
             def __init__(self, *, name, allowed_modules, providers):
-                self.providers = providers
+                self.models = {"detection": fake_provider_model(providers)}
 
             def prepare(self, *, ctx_id, det_size):
                 pass
@@ -456,6 +492,38 @@ class DetectorInitializationTests(unittest.TestCase):
             detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "coreml")
 
         self.assertEqual(["CPUExecutionProvider"], providers)
+
+    def test_probe_provider_mode_detects_runtime_fallback_to_cpu(self) -> None:
+        class FakeOrt:
+            @staticmethod
+            def get_available_providers():
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        class FakeNP:
+            uint8 = object()
+
+            @staticmethod
+            def zeros(_shape, dtype=None):
+                return {"dtype": dtype}
+
+        class FakeFaceAnalysis:
+            def __init__(self, *, name, allowed_modules, providers):
+                self.models = {"detection": fake_provider_model(["CPUExecutionProvider"])}
+
+            def prepare(self, *, ctx_id, det_size):
+                pass
+
+            def get(self, _frame):
+                return []
+
+        with patch(
+            "kdenlive_face_mask._import_detection_modules",
+            return_value=("fake-cv2", FakeNP(), FakeOrt(), FakeFaceAnalysis),
+        ):
+            probe = probe_provider_mode((320, 320), "buffalo_s", "cuda")
+
+        self.assertEqual("fallback-to-cpu", probe["status"])
+        self.assertEqual(["CPUExecutionProvider"], probe["active_providers"])
 
 
 class ClipboardTests(unittest.TestCase):
@@ -486,7 +554,21 @@ class ClipboardTests(unittest.TestCase):
         self.assertEqual("<xml/>", result)
         called_cmd = mock_run.call_args[0][0]
         self.assertEqual("powershell.exe", called_cmd[0])
-        self.assertIn("Get-Clipboard", called_cmd)
+        self.assertIn("Get-Clipboard", called_cmd[-1])
+
+    def test_read_from_clipboard_decodes_utf8_powershell_output(self) -> None:
+        def fake_which(cmd: str):
+            return r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" if cmd == "powershell.exe" else None
+
+        expected = "<clip title=\"cafe 日本\"/>"
+        with patch("kdenlive_face_mask.shutil.which", side_effect=fake_which):
+            with patch(
+                "kdenlive_face_mask.subprocess.run",
+                return_value=type("R", (), {"returncode": 0, "stdout": expected.encode("utf-8")})(),
+            ):
+                result = read_from_clipboard()
+
+        self.assertEqual(expected, result)
 
     def test_write_to_clipboard_uses_pbcopy_on_macos(self) -> None:
         def fake_which(cmd: str):
@@ -503,7 +585,28 @@ class ClipboardTests(unittest.TestCase):
         called_cmd = mock_popen.call_args[0][0]
         self.assertEqual(["pbcopy"], called_cmd)
 
-    def test_write_to_clipboard_uses_clip_exe_on_windows(self) -> None:
+    def test_write_to_clipboard_prefers_powershell_on_windows(self) -> None:
+        def fake_which(cmd: str):
+            if cmd == "powershell.exe":
+                return r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            if cmd == "clip.exe":
+                return r"C:\Windows\System32\clip.exe"
+            return None
+
+        mock_process = unittest.mock.MagicMock()
+        mock_process.communicate.return_value = ("", "")
+        mock_process.returncode = 0
+
+        with patch("kdenlive_face_mask.shutil.which", side_effect=fake_which):
+            with patch("kdenlive_face_mask.subprocess.Popen", return_value=mock_process) as mock_popen:
+                write_to_clipboard("<xml/>")
+
+        called_cmd = mock_popen.call_args[0][0]
+        self.assertEqual("powershell.exe", called_cmd[0])
+        self.assertIn("Set-Clipboard", called_cmd[-1])
+        self.assertEqual("utf-8", mock_popen.call_args.kwargs["encoding"])
+
+    def test_write_to_clipboard_falls_back_to_clip_exe_on_windows(self) -> None:
         def fake_which(cmd: str):
             return r"C:\Windows\System32\clip.exe" if cmd == "clip.exe" else None
 
@@ -517,6 +620,7 @@ class ClipboardTests(unittest.TestCase):
 
         called_cmd = mock_popen.call_args[0][0]
         self.assertEqual(["clip.exe"], called_cmd)
+
     def test_replaces_existing_mask_effects(self) -> None:
         rewritten = rewrite_scene_with_tracks(
             SCENE_XML,
@@ -534,6 +638,37 @@ class ClipboardTests(unittest.TestCase):
         effects = video_clip.findall("./effects/effect")
         self.assertEqual(1, len(effects))
         self.assertTrue(all(effect.attrib.get("id") == MASK_EFFECT_ID for effect in effects))
+
+    def test_no_tracks_clear_generated_masks_in_replace_mode(self) -> None:
+        rewritten = rewrite_scene_with_tracks(
+            SCENE_XML,
+            [],
+            frame_width=1920,
+            frame_height=1080,
+            shape=0.38,
+            tilt=0.5,
+            replace_existing_masks=True,
+        )
+
+        root = ET.fromstring(rewritten)
+        effects = root.findall("./clip[@id='15']/effects/effect")
+        self.assertEqual([], effects)
+
+    def test_no_tracks_preserve_existing_masks_in_keep_mode(self) -> None:
+        rewritten = rewrite_scene_with_tracks(
+            SCENE_XML,
+            [],
+            frame_width=1920,
+            frame_height=1080,
+            shape=0.38,
+            tilt=0.5,
+            replace_existing_masks=False,
+        )
+
+        root = ET.fromstring(rewritten)
+        effects = root.findall("./clip[@id='15']/effects/effect")
+        self.assertEqual(1, len(effects))
+        self.assertEqual(MASK_EFFECT_ID, effects[0].attrib.get("id"))
 
     def test_overlapping_tracks_remain_separate_effects(self) -> None:
         rewritten = rewrite_scene_with_tracks(
@@ -705,6 +840,59 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNotNone(size_x)
         self.assertEqual("0=0.0197917;4=0.0197917;7=0.0197917;8=0", size_x.text)
 
+    def test_face_angle_emits_tilt_keyframes(self) -> None:
+        track = FaceTrack(
+            track_id=13,
+            samples=[
+                TrackSample(frame_index=0, cx=420.0, cy=140.0, half_w=38.0, half_h=54.0, angle_deg=0.0),
+                TrackSample(frame_index=1, cx=422.0, cy=141.0, half_w=38.0, half_h=54.0, angle_deg=90.0),
+                TrackSample(frame_index=2, cx=424.0, cy=142.0, half_w=38.0, half_h=54.0, angle_deg=-90.0),
+            ],
+        )
+
+        rewritten = rewrite_scene_with_tracks(
+            SCENE_XML,
+            [track],
+            frame_width=1920,
+            frame_height=1080,
+            shape=0.38,
+            tilt=0.5,
+            replace_existing_masks=True,
+        )
+
+        root = ET.fromstring(rewritten)
+        effect = root.find("./clip[@id='15']/effects/effect")
+        self.assertIsNotNone(effect)
+        tilt = effect.find("./property[@name='filter.Tilt']")
+        self.assertIsNotNone(tilt)
+        self.assertEqual("0=0.5;1=0.75;2=0.25;3=0.25", tilt.text)
+
+    def test_face_angle_uses_requested_tilt_as_neutral_baseline(self) -> None:
+        track = FaceTrack(
+            track_id=14,
+            samples=[
+                TrackSample(frame_index=0, cx=420.0, cy=140.0, half_w=38.0, half_h=54.0, angle_deg=0.0),
+                TrackSample(frame_index=1, cx=422.0, cy=141.0, half_w=38.0, half_h=54.0, angle_deg=90.0),
+            ],
+        )
+
+        rewritten = rewrite_scene_with_tracks(
+            SCENE_XML,
+            [track],
+            frame_width=1920,
+            frame_height=1080,
+            shape=0.38,
+            tilt=0.25,
+            replace_existing_masks=True,
+        )
+
+        root = ET.fromstring(rewritten)
+        effect = root.find("./clip[@id='15']/effects/effect")
+        self.assertIsNotNone(effect)
+        tilt = effect.find("./property[@name='filter.Tilt']")
+        self.assertIsNotNone(tilt)
+        self.assertEqual("0=0.25;1=0.5;2=0.5", tilt.text)
+
 
 class KeyframeDensityTests(unittest.TestCase):
     @staticmethod
@@ -759,6 +947,37 @@ class KeyframeDensityTests(unittest.TestCase):
         self.assertLess(slow_visible_count, fast_visible_count)
         self.assertEqual([0, 7], [frame.frame_index for frame in slow if frame.size_x == 0.0])
         self.assertEqual([0, 7], [frame.frame_index for frame in fast if frame.size_x == 0.0])
+
+
+class ValidationTests(unittest.TestCase):
+    def test_build_mask_frames_rejects_non_positive_dimensions(self) -> None:
+        track = FaceTrack(
+            track_id=1,
+            samples=[TrackSample(frame_index=0, cx=10.0, cy=10.0, half_w=2.0, half_h=2.0)],
+        )
+
+        with self.assertRaisesRegex(ValueError, "Invalid source video resolution"):
+            build_mask_frames(track, total_frames=1, frame_width=0, frame_height=1080)
+
+    def test_main_rejects_invalid_min_score_before_processing(self) -> None:
+        exit_code = main(["--min-score", "1.5", "--log-level", "ERROR"])
+
+        self.assertEqual(1, exit_code)
+
+    def test_main_rejects_invalid_adaptive_keyframe_range(self) -> None:
+        exit_code = main(
+            [
+                "--adaptive-keyframes",
+                "--min-keyframe-fps",
+                "60",
+                "--max-keyframe-fps",
+                "30",
+                "--log-level",
+                "ERROR",
+            ]
+        )
+
+        self.assertEqual(1, exit_code)
 
 
 class SmoothTrackTests(unittest.TestCase):
@@ -861,6 +1080,22 @@ class DoctorModeTests(unittest.TestCase):
 
 
 class EndToEndCliSmokeTests(unittest.TestCase):
+    def test_main_succeeds_when_no_tracks_are_generated(self) -> None:
+        stdout = io.StringIO()
+
+        with patch("kdenlive_face_mask.read_text_input", return_value=SCENE_XML):
+            with patch(
+                "kdenlive_face_mask.generate_tracks",
+                return_value=([], 1920, 1080, ["CPUExecutionProvider"]),
+            ):
+                with contextlib.redirect_stdout(stdout):
+                    exit_code = main(["--log-level", "ERROR"])
+
+        self.assertEqual(0, exit_code)
+        root = ET.fromstring(stdout.getvalue())
+        effects = root.findall("./clip[@id='15']/effects/effect")
+        self.assertEqual([], effects)
+
     def test_main_rewrites_xml_from_real_video_with_fake_detector(self) -> None:
         import cv2
         import numpy as np

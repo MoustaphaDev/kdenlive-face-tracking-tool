@@ -38,7 +38,12 @@ READ_CLIPBOARD_COMMANDS = [
     ["xclip", "-selection", "clipboard", "-out"],
     ["xsel", "--clipboard", "--output"],
     ["pbpaste"],
-    ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
+    [
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-Clipboard -Raw",
+    ],
 ]
 
 WRITE_CLIPBOARD_COMMANDS = [
@@ -46,6 +51,12 @@ WRITE_CLIPBOARD_COMMANDS = [
     ["xclip", "-selection", "clipboard", "-in"],
     ["xsel", "--clipboard", "--input"],
     ["pbcopy"],
+    [
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+    ],
     ["clip.exe"],
 ]
 
@@ -181,6 +192,7 @@ class MaskFrame:
     pos_y: float
     size_x: float
     size_y: float
+    tilt: float = DEFAULT_TILT
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -293,6 +305,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    if args.process_width < 0:
+        raise ValueError(f"Invalid process-width {args.process_width}; expected 0 or a positive integer")
+    if not 0.0 <= args.min_score <= 1.0:
+        raise ValueError(f"Invalid min-score {args.min_score}; expected a value between 0 and 1")
+    if args.pad_x <= -1.0:
+        raise ValueError(f"Invalid pad-x {args.pad_x}; expected a value greater than -1")
+    if args.pad_y <= -1.0:
+        raise ValueError(f"Invalid pad-y {args.pad_y}; expected a value greater than -1")
+    if args.max_gap < 0:
+        raise ValueError(f"Invalid max-gap {args.max_gap}; expected 0 or a positive integer")
+    if args.min_track_length < 1:
+        raise ValueError(f"Invalid min-track-length {args.min_track_length}; expected at least 1")
+    if args.smooth_window < 0:
+        raise ValueError(f"Invalid smooth-window {args.smooth_window}; expected 0 or a positive integer")
+    if args.keyframe_fps < 0.0:
+        raise ValueError(f"Invalid keyframe-fps {args.keyframe_fps}; expected 0 or a positive number")
+    if args.min_keyframe_fps < 0.0:
+        raise ValueError(f"Invalid min-keyframe-fps {args.min_keyframe_fps}; expected 0 or a positive number")
+    if args.max_keyframe_fps < 0.0:
+        raise ValueError(f"Invalid max-keyframe-fps {args.max_keyframe_fps}; expected 0 or a positive number")
+    if args.max_keyframe_fps > 0.0 and args.min_keyframe_fps > args.max_keyframe_fps:
+        raise ValueError(
+            f"Invalid adaptive keyframe range min={args.min_keyframe_fps} max={args.max_keyframe_fps}; expected min <= max"
+        )
+    if args.progress_every < 0:
+        raise ValueError(f"Invalid progress-every {args.progress_every}; expected 0 or a positive integer")
+
+
 def configure_logging(level_name: str) -> None:
     logging.basicConfig(level=getattr(logging, level_name), format="[maskgen] %(levelname)s: %(message)s")
 
@@ -356,7 +397,7 @@ def detect_host_environment() -> dict[str, str | None]:
 def detect_onnxruntime_support() -> dict[str, Any]:
     try:
         import onnxruntime as ort  # type: ignore
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         return {
             "import_ok": False,
             "version": None,
@@ -426,7 +467,9 @@ def probe_provider_mode(det_size: tuple[int, int], model_name: str, provider_mod
     finally:
         LOG.setLevel(previous_level)
 
-    if requested_provider in active_providers:
+    if not active_providers:
+        status = "initialized-provider-unknown"
+    elif requested_provider in active_providers:
         status = "usable"
     elif provider_mode != "cpu" and "CPUExecutionProvider" in active_providers:
         status = "fallback-to-cpu"
@@ -460,6 +503,8 @@ def format_provider_probe_for_report(probe: dict[str, Any]) -> str:
         return f"- {probe['mode']}: usable ({active_providers})"
     if probe["status"] == "fallback-to-cpu":
         return f"- {probe['mode']}: detected but unusable for detector init; fell back to {active_providers}"
+    if probe["status"] == "initialized-provider-unknown":
+        return f"- {probe['mode']}: initialized, but active providers could not be introspected"
     return f"- {probe['mode']}: failed ({probe['error']})"
 
 
@@ -469,6 +514,8 @@ def format_provider_probe_for_issue_body(probe: dict[str, Any]) -> str:
         return f"- {probe['mode']}: usable ({active_providers})"
     if probe["status"] == "fallback-to-cpu":
         return f"- {probe['mode']}: detected but unusable for detector init; fell back to {active_providers}"
+    if probe["status"] == "initialized-provider-unknown":
+        return f"- {probe['mode']}: initialized, but active providers could not be introspected"
     return f"- {probe['mode']}: failed ({probe['error']})"
 
 
@@ -943,25 +990,79 @@ def smooth_track(track: FaceTrack, radius: int) -> FaceTrack:
 def _import_detection_modules():
     try:
         import cv2  # type: ignore
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         raise RuntimeError("opencv-python is required to read the source media") from exc
 
     try:
         import numpy as np  # type: ignore
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         raise RuntimeError("numpy is required to warm up InsightFace") from exc
 
     try:
         import onnxruntime as ort  # type: ignore
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         raise RuntimeError("onnxruntime is required to run InsightFace") from exc
 
     try:
         from insightface.app import FaceAnalysis  # type: ignore
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         raise RuntimeError("insightface is required to run face detection") from exc
 
     return cv2, np, ort, FaceAnalysis
+
+
+def unique_provider_names(providers: Iterable[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for provider in providers:
+        provider_name = str(provider)
+        if provider_name in seen:
+            continue
+        unique.append(provider_name)
+        seen.add(provider_name)
+    return unique
+
+
+def detector_active_providers(value: Any, *, _seen: set[int] | None = None, _depth: int = 0) -> list[str]:
+    if value is None or _depth > 4:
+        return []
+
+    if _seen is None:
+        _seen = set()
+
+    value_id = id(value)
+    if value_id in _seen:
+        return []
+    _seen.add(value_id)
+
+    get_providers = getattr(value, "get_providers", None)
+    if callable(get_providers):
+        try:
+            providers = get_providers()
+        except Exception:
+            providers = None
+        if isinstance(providers, Sequence) and not isinstance(providers, (str, bytes, bytearray)):
+            return unique_provider_names(str(provider) for provider in providers)
+
+    nested_values: list[Any] = []
+    for attribute_name in ("models", "model", "det_model", "session", "sess"):
+        with contextlib.suppress(Exception):
+            nested_value = getattr(value, attribute_name)
+            if nested_value is not None:
+                nested_values.append(nested_value)
+
+    if isinstance(value, dict):
+        nested_values.extend(value.values())
+    elif isinstance(value, (list, tuple, set)):
+        nested_values.extend(value)
+    else:
+        with contextlib.suppress(TypeError, ValueError, AttributeError):
+            nested_values.extend(vars(value).values())
+
+    providers_found: list[str] = []
+    for nested_value in nested_values:
+        providers_found.extend(detector_active_providers(nested_value, _seen=_seen, _depth=_depth + 1))
+    return unique_provider_names(providers_found)
 
 
 def build_detector(det_size: tuple[int, int], model_name: str, provider_mode: str):
@@ -1013,7 +1114,7 @@ def build_detector(det_size: tuple[int, int], model_name: str, provider_mode: st
                 app = FaceAnalysis(name=model_name, allowed_modules=["detection"], providers=providers)
                 app.prepare(ctx_id=0, det_size=det_size)
                 app.get(np.zeros((360, 640, 3), dtype=np.uint8))
-            return app, providers, cv2
+            return app, detector_active_providers(app), cv2
         except Exception as exc:  # pragma: no cover - hardware/provider dependent
             last_error = exc
             LOG.warning("Detector init failed for providers=%s: %s", providers, exc)
@@ -1151,16 +1252,28 @@ def iter_clip_detections(
         capture.release()
 
 
-def build_mask_frames(track: FaceTrack, total_frames: int, frame_width: int, frame_height: int) -> list[MaskFrame]:
+def build_mask_frames(
+    track: FaceTrack,
+    total_frames: int,
+    frame_width: int,
+    frame_height: int,
+    base_tilt: float = DEFAULT_TILT,
+) -> list[MaskFrame]:
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError(f"Invalid source video resolution {frame_width}x{frame_height}; dimensions must be positive")
+
     sample_by_frame = {sample.frame_index: sample for sample in track.samples}
     sorted_frame_indices = sorted(sample_by_frame)
+
+    def frame_tilt(sample: TrackSample) -> float:
+        return (base_tilt + sample.angle_deg / 360.0) % 1.0
 
     def normalized(sample: TrackSample, frame_index: int | None = None, zero_size: bool = False) -> MaskFrame:
         pos_x = min(max(sample.cx / frame_width, 0.0), 1.0)
         pos_y = min(max(sample.cy / frame_height, 0.0), 1.0)
         size_x = 0.0 if zero_size else min(max(sample.half_w / frame_width, 0.0), 1.0)
         size_y = 0.0 if zero_size else min(max(sample.half_h / frame_height, 0.0), 1.0)
-        return MaskFrame(sample.frame_index if frame_index is None else frame_index, pos_x, pos_y, size_x, size_y)
+        return MaskFrame(sample.frame_index if frame_index is None else frame_index, pos_x, pos_y, size_x, size_y, frame_tilt(sample))
 
     segments: list[list[int]] = [[sorted_frame_indices[0]]]
     for frame_index in sorted_frame_indices[1:]:
@@ -1236,8 +1349,9 @@ def split_visible_mask_segments(frames: Sequence[MaskFrame]) -> list[list[MaskFr
 def mask_frame_motion_ratio(left: MaskFrame, right: MaskFrame) -> float:
     delta_position = math.hypot(right.pos_x - left.pos_x, right.pos_y - left.pos_y)
     delta_size = math.hypot(right.size_x - left.size_x, right.size_y - left.size_y)
+    delta_tilt = min(abs(right.tilt - left.tilt), 1.0 - abs(right.tilt - left.tilt)) * 0.25
     scale = max(math.hypot(left.size_x * 2.0, left.size_y * 2.0), math.hypot(right.size_x * 2.0, right.size_y * 2.0), 1e-6)
-    return (delta_position + 0.5 * delta_size) / scale
+    return (delta_position + 0.5 * delta_size + delta_tilt) / scale
 
 
 def compute_segment_motion_ratios(segment: Sequence[MaskFrame]) -> list[float]:
@@ -1380,7 +1494,7 @@ def make_mask_effect(
 ) -> ET.Element:
     effect = ET.Element("effect", {"id": MASK_EFFECT_ID})
     frames = thin_mask_frames(
-        build_mask_frames(track, total_frames, frame_width, frame_height),
+        build_mask_frames(track, total_frames, frame_width, frame_height, tilt),
         clip_fps=clip_fps,
         keyframe_fps=keyframe_fps,
         adaptive_keyframes=adaptive_keyframes,
@@ -1390,7 +1504,7 @@ def make_mask_effect(
     effect.append(make_property("kdenlive:collapsed", "1"))
     effect.append(make_property("filter.Min", build_constant_keyframe_string(frames, 0.0)))
     effect.append(make_property("filter.Transition width", build_constant_keyframe_string(frames, 0.0)))
-    effect.append(make_property("filter.Tilt", build_constant_keyframe_string(frames, tilt)))
+    effect.append(make_property("filter.Tilt", build_keyframe_string(frames, lambda item: item.tilt)))
     effect.append(make_property("filter.Size Y", build_keyframe_string(frames, lambda item: item.size_y)))
     effect.append(make_property("filter.Max", build_constant_keyframe_string(frames, 1.0)))
     effect.append(make_property("filter.Size X", build_keyframe_string(frames, lambda item: item.size_x)))
@@ -1422,16 +1536,18 @@ def rewrite_scene_with_tracks(
     min_keyframe_fps: float = DEFAULT_MIN_KEYFRAME_FPS,
     max_keyframe_fps: float = 0.0,
 ) -> str:
-    if not tracks:
-        raise ValueError("No face tracks were generated for this clip")
-
     context = resolve_scene_context(xml_text)
     effects = get_or_create_effects_element(context.video_clip)
-    merged_tracks = merge_disjoint_tracks(tracks)
     if replace_existing_masks:
         for effect in list(effects):
             if effect.tag == "effect" and effect.attrib.get("id") == MASK_EFFECT_ID:
                 effects.remove(effect)
+
+    if not tracks:
+        ET.indent(context.root, space=" ")
+        return ET.tostring(context.root, encoding="unicode")
+
+    merged_tracks = merge_disjoint_tracks(tracks)
 
     for index, track in enumerate(merged_tracks):
         effects.append(
@@ -1478,15 +1594,25 @@ def write_text_output(text: str, args: argparse.Namespace) -> None:
 
 
 def read_from_clipboard() -> str:
+    def decode_clipboard_stdout(command_name: str, stdout: bytes) -> str | None:
+        encodings = ["utf-8"]
+        if command_name == "powershell.exe":
+            encodings.extend(["utf-16-le", "utf-16"])
+        for encoding in encodings:
+            try:
+                return stdout.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return None
+
     for command in READ_CLIPBOARD_COMMANDS:
         if shutil.which(command[0]) is None:
             continue
         result = subprocess.run(command, capture_output=True, check=False)
         if result.returncode == 0:
-            try:
-                return result.stdout.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
+            decoded = decode_clipboard_stdout(command[0], result.stdout)
+            if decoded is not None:
+                return decoded
     raise RuntimeError("Unable to read clipboard. Install wl-clipboard or xclip/xsel (Linux), or use pbpaste (macOS). On Windows, ensure PowerShell is available.")
 
 
@@ -1501,6 +1627,7 @@ def write_to_clipboard(text: str) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 start_new_session=True,
             )
         except OSError:
@@ -1546,6 +1673,10 @@ def generate_tracks(context: SceneContext, args: argparse.Namespace) -> tuple[li
     )
     if context.frame_width is None or context.frame_height is None:
         raise RuntimeError("Unable to determine source video resolution")
+    if context.frame_width <= 0 or context.frame_height <= 0:
+        raise RuntimeError(
+            f"Invalid source video resolution {context.frame_width}x{context.frame_height}; dimensions must be positive"
+        )
     return tracks, context.frame_width, context.frame_height, providers
 
 
@@ -1554,6 +1685,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(args.log_level)
 
     try:
+        validate_args(args)
+
         if args.doctor:
             doctor_report = build_doctor_report(args)
             output_text = format_doctor_report(doctor_report)
@@ -1571,6 +1704,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             context.source_path,
             providers,
         )
+        if not tracks:
+            LOG.info(
+                "No face tracks were generated for %s; %s",
+                context.source_path,
+                "replacing existing generated masks with none"
+                if not args.keep_existing_masks
+                else "leaving existing masks unchanged",
+            )
         output_text = rewrite_scene_with_tracks(
             xml_text,
             tracks,
@@ -1585,8 +1726,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_keyframe_fps=args.max_keyframe_fps,
         )
         write_text_output(output_text, args)
-    except Exception as exc:
+    except (ValueError, RuntimeError, FileNotFoundError) as exc:
         LOG.error("%s", exc)
+        return 1
+    except Exception as exc:
+        LOG.debug("Unexpected internal failure", exc_info=True)
+        LOG.error("Unexpected internal failure: %s: %s", exc.__class__.__name__, exc)
         return 1
 
     return 0

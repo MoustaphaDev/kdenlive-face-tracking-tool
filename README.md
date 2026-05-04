@@ -62,9 +62,10 @@ If clipboard integration is unavailable or you want easier debugging, switch to 
 ## Runtime Notes
 
 - First run may download InsightFace model weights into the local model cache if the selected model is not already present.
-- `--clipboard-in` and `--clipboard-out` work on Linux (`wl-paste`/`wl-copy`, `xclip`, or `xsel`), macOS (`pbpaste`/`pbcopy`), and Windows (`powershell.exe`/`clip.exe`).
+- `--clipboard-in` and `--clipboard-out` work on Linux (`wl-paste`/`wl-copy`, `xclip`, or `xsel`), macOS (`pbpaste`/`pbcopy`), and Windows (preferring a UTF-8 PowerShell path with `clip.exe` as fallback).
 - If you want the fewest moving parts, start with CPU mode first and then switch to CUDA, ROCm, CoreML, or OpenVINO after the basic workflow works.
 - If ONNX Runtime cannot initialize a requested GPU provider, the tool falls back to CPU.
+- If no faces are detected, the tool still succeeds. In the default replace mode it removes generated mask effects from the target clip; with `--keep-existing-masks` it leaves existing mask effects unchanged.
 
 ## Validation Status
 
@@ -150,6 +151,8 @@ For Kdenlive compatibility, non-overlapping spans for the same tracked face are 
 
 Position smoothing is motion-adaptive: slow movement is smoothed to reduce jitter, while sharp jumps keep the real detected position so the mask does not visibly trail fast head movement.
 
+Mask tilt follows the detected eye-line angle for each tracked face. `--tilt` remains the neutral baseline, so you can bias the generated mask orientation while still keeping per-frame face rotation.
+
 Detection and tracking run at full clip FPS. Keyframe-density controls only reduce serialized Kdenlive keyframes written into XML after tracking is complete.
 
 ### Basic Usage
@@ -178,7 +181,7 @@ wl-paste --no-newline | uv run kdenlive-face-mask > rewritten-clip.xml
 
 - `input` (positional) reads copied-clip XML from a file path; omit it to read from stdin.
 - `-o, --output FILE` writes rewritten XML to a file; omit it to write to stdout.
-- `--clipboard-in` and `--clipboard-out` read/write XML through the system clipboard. Requires `wl-clipboard` or `xclip`/`xsel` on Linux, uses built-in `pbpaste`/`pbcopy` on macOS, and `powershell.exe`/`clip.exe` on Windows.
+- `--clipboard-in` and `--clipboard-out` read/write XML through the system clipboard. Requires `wl-clipboard` or `xclip`/`xsel` on Linux, uses built-in `pbpaste`/`pbcopy` on macOS, and prefers a UTF-8 PowerShell path on Windows with `clip.exe` as fallback.
 - `--det-size WIDTHxHEIGHT` sets detector input size, for example `320x320` for speed or `640x640` for smaller faces.
 - `--model-name MODEL` chooses InsightFace model, for example `buffalo_s` for speed or `buffalo_l` for offline quality.
 - `--provider-mode auto|cuda|rocm|coreml|openvino|migraphx|cpu`.
@@ -199,7 +202,8 @@ wl-paste --no-newline | uv run kdenlive-face-mask > rewritten-clip.xml
 - `--min-keyframe-fps` and `--max-keyframe-fps` bound adaptive output density.
 - `--max-gap` controls how many missing detection frames can be bridged inside one track.
 - `--min-track-length` discards very short false-positive tracks.
-- `--shape` and `--tilt` set generated alphaspot mask geometry parameters.
+- `--shape` sets the generated alphaspot mask geometry.
+- `--tilt` sets the neutral alphaspot tilt baseline before tracked face-angle offsets are applied.
 - `--progress-every N` logs progress every N processed frames.
 - `--log-level DEBUG|INFO|WARNING|ERROR` controls logging verbosity.
 

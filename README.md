@@ -32,6 +32,13 @@ If the embedded player does not render in your viewer, open [media/demo.mp4](med
 
 ## Install
 
+Clone the repository and enter the checkout first:
+
+```bash
+git clone https://github.com/MoustaphaDev/kdenlive-face-tracking-tool.git
+cd kdenlive-face-tracking-tool
+```
+
 Start with the simplest CPU path:
 
 ```bash

@@ -6,6 +6,13 @@ Back to [README](../README.md). For CLI flags, example commands, and Kdenlive wo
 
 ## Installation
 
+Clone the repository and enter the checkout first:
+
+```bash
+git clone https://github.com/MoustaphaDev/kdenlive-face-tracking-tool.git
+cd kdenlive-face-tracking-tool
+```
+
 Default CPU install:
 
 ```bash
@@ -157,6 +164,8 @@ You can force a provider mode during execution with `--provider-mode` (`cuda`, `
 
 If ROCm inference is more stable inside a pinned container, use the included ROCm image for offline Kdenlive masking.
 
+All commands in this section assume you are still in the cloned repository root. Here, `kdenlive-mask` is the wrapper subcommand passed to `run_kdenlive_rocm_container.fish`, not a standalone host command.
+
 Wrapper command options:
 
 - `build` builds the ROCm image referenced by the wrapper script.
@@ -172,7 +181,6 @@ Note on image size:
 Build the shared ROCm image once:
 
 ```bash
-cd kdenlive-face-tracking-tool
 fish run_kdenlive_rocm_container.fish build
 ```
 

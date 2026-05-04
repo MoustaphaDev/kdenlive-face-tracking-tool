@@ -2,12 +2,14 @@
 
 Standalone offline tooling for Kdenlive mask generation.
 
+Targets Linux, macOS, and Windows, with CPU as the default path and optional CUDA, ROCm, CoreML, and OpenVINO providers where the host runtime stack supports them.
+
 ## Install
 
 Default CPU install:
 
 ```bash
-uv sync
+uv sync --extra cpu
 ```
 
 NVIDIA CUDA install:
@@ -22,25 +24,123 @@ AMD ROCm install:
 uv sync --extra rocm
 ```
 
+Intel OpenVINO install:
+
+```bash
+uv sync --extra openvino
+```
+
 The installed CLI is:
 
 ```bash
 uv run kdenlive-face-mask --help
 ```
 
-Why three install modes:
+Why four install modes:
 
-- `uv sync` is the recommended default and works on machines without ROCm/GPU acceleration.
+- `uv sync --extra cpu` installs the standard `onnxruntime` package for CPU mode and CoreML-capable macOS hosts.
 - `uv sync --extra cuda` adds NVIDIA CUDA ONNX Runtime packages. NVIDIA users usually do not need the container workflow.
 - `uv sync --extra rocm` adds ROCm ONNX Runtime packages for users who want AMD GPU inference.
+- `uv sync --extra openvino` adds OpenVINO ONNX Runtime packages for Intel GPU inference.
+- CoreML (Apple Silicon and Intel Mac GPU) is provided by the standard `onnxruntime` package, so it uses the same `cpu` extra.
+- Choose exactly one runtime extra per environment. The ONNX Runtime packages are alternatives, not meant to be installed together.
 - The tool behavior is unchanged either way: provider selection is controlled at runtime with `--provider-mode`.
+
+## Recommended First Run
+
+For a first run on a local desktop machine, use the easiest path first:
+
+1. `uv sync --extra cpu`
+2. `uv run kdenlive-face-mask --doctor`
+3. `uv run kdenlive-face-mask --clipboard-in --clipboard-out --provider-mode cpu`
+4. After the CPU path works, try `cuda`, `rocm`, `coreml`, `openvino`, or the ROCm container workflow if you want acceleration.
+
+Replace step 1 with the runtime extra you actually want to test (`cpu`, `cuda`, `rocm`, or `openvino`).
+
+If clipboard integration is unavailable or you want easier debugging, switch to file-based input/output documented later in the README instead.
 
 ## Runtime Notes
 
 - First run may download InsightFace model weights into the local model cache if the selected model is not already present.
-- `--clipboard-in` and `--clipboard-out` are Linux-oriented paths. Install one clipboard tool such as `wl-paste`/`wl-copy`, `xclip`, or `xsel`.
-- If you want the fewest moving parts, start with CPU mode first and then switch to CUDA or ROCm after the basic workflow works.
+- `--clipboard-in` and `--clipboard-out` work on Linux (`wl-paste`/`wl-copy`, `xclip`, or `xsel`), macOS (`pbpaste`/`pbcopy`), and Windows (`powershell.exe`/`clip.exe`).
+- If you want the fewest moving parts, start with CPU mode first and then switch to CUDA, ROCm, CoreML, or OpenVINO after the basic workflow works.
 - If ONNX Runtime cannot initialize a requested GPU provider, the tool falls back to CPU.
+
+## Validation Status
+
+- Real-world validation so far includes one Arch Linux machine with an AMD 8745HS APU.
+- The included ROCm container workflow has also been validated on that host and successfully initialized ROCm, MIGraphX, and CPU providers.
+- The repository includes CI smoke coverage for Linux, macOS, and Windows install, unit-test, and CLI-help checks.
+- Non-Linux hosts and most GPU/provider combinations should still be treated as expected-to-work rather than broadly validated.
+- Intel macOS is not currently supported by the documented install path because the `cpu` extra currently resolves to Apple Silicon macOS wheels, not Intel macOS wheels.
+
+## Development Note
+
+This project was developed with substantial AI assistance, including architecture planning, Kdenlive XML analysis, iterative requirement refinement, code generation, and most of the documentation.
+
+The implementation has since been manually reviewed at a high level and tested in the environments documented here, but it has not been independently re-derived or exhaustively line-by-line audited.
+
+## Compatibility Matrix
+
+| Platform | CPU mode | CUDA | ROCm | CoreML | OpenVINO | Clipboard I/O |
+| --- | --- | --- | --- | --- | --- | --- |
+| Linux (x86_64) | Validated on one Arch Linux + AMD host | Expected with a matching NVIDIA stack | Expected on compatible AMD Linux stacks | Not applicable | Expected on compatible Intel stacks | Implemented; Linux workflow validated |
+| Windows (x86_64) | Expected; CI smoke coverage only | Expected with a matching NVIDIA stack | Not supported | Not applicable | Expected on compatible Intel stacks | Implemented; not hardware-validated |
+| macOS (Apple Silicon) | Expected | Not supported | Not supported | Expected | Not supported | Implemented; not hardware-validated |
+| macOS (Intel) | Not currently supported by the documented install path | Not supported | Not supported | Not currently supported by the documented install path | Not supported | Command paths are implemented, but runtime dependency support is currently unconfirmed |
+
+Notes:
+
+- CPU mode is the least risky default where the required wheels install successfully.
+- GPU/provider availability depends on host drivers, runtime libraries, and ONNX Runtime provider builds.
+- The included ROCm container has been observed to initialize ROCm, MIGraphX, and CPU providers on the validated AMD Linux host.
+- CI smoke coverage checks install, unit tests, and `kdenlive-face-mask --help` on Linux, macOS, and Windows; it does not prove GPU-backed inference or broad hardware compatibility.
+
+## Doctor Mode
+
+Use the built-in doctor mode to print host diagnostics without processing clip XML:
+
+```bash
+uv run kdenlive-face-mask --doctor
+```
+
+Doctor mode is the recommended diagnostic path because it checks both what ONNX Runtime advertises and what detector initialization can actually use on the current machine.
+
+Doctor mode reports:
+
+- Host OS, architecture, and Python version.
+- ONNX Runtime import status and available execution providers.
+- Real provider usability checks by attempting detector initialization for each detected provider mode and CPU fallback.
+- Detected clipboard backend commands.
+- The current README support bucket for this host.
+- A suggested provider mode for first-run and preferred local testing.
+
+Notes:
+
+- Doctor mode can take longer than `--help` because it attempts real detector initialization.
+- If the selected InsightFace model is not cached yet, doctor mode may trigger a model download before provider usability checks can complete.
+
+On hosts that appear to work but are still untested in the README, or are not listed there yet, doctor mode also prints a suggested issue/PR title and body. The suggestion is advisory only: support claims are still updated manually after review rather than inferred automatically from command output.
+
+## Low-Level Provider List Check
+
+If you need a lower-level check of what ONNX Runtime advertises before full detector initialization, use:
+
+```bash
+uv run python -c "import onnxruntime as ort; print('\\n'.join(ort.get_available_providers()))"
+```
+
+This check does not prove that detector initialization succeeds for a provider; use `--doctor` for the stronger check.
+
+Expected examples:
+
+- CPU-only environment: `CPUExecutionProvider`
+- NVIDIA environment: includes `CUDAExecutionProvider`
+- AMD ROCm environment (Linux): includes `ROCMExecutionProvider`
+- Apple Silicon or Intel Mac environment: includes `CoreMLExecutionProvider`
+- Intel OpenVINO environment: includes `OpenVINOExecutionProvider`
+
+You can force a provider mode during execution with `--provider-mode` (`cuda`, `rocm`, `coreml`, `openvino`, `migraphx`, or `cpu`). If provider init fails, the tool falls back to CPU.
 
 ## kdenlive_face_mask.py
 
@@ -54,17 +154,19 @@ Detection and tracking run at full clip FPS. Keyframe-density controls only redu
 
 ### Basic Usage
 
-File-based input/output:
-
-```bash
-uv run kdenlive-face-mask copied-clip.xml -o rewritten-clip.xml
-```
-
-Clipboard-driven usage on Linux:
+Clipboard-driven usage:
 
 ```bash
 uv run kdenlive-face-mask --clipboard-in --clipboard-out
 ```
+
+File-based input/output:
+
+```bash
+uv run kdenlive-face-mask /path/to/copied-clip.xml -o /path/to/rewritten-clip.xml
+```
+
+The input path is a placeholder for a real copied-clip XML file you saved locally; it is not a file shipped in this repository.
 
 Pipe-based usage:
 
@@ -76,11 +178,14 @@ wl-paste --no-newline | uv run kdenlive-face-mask > rewritten-clip.xml
 
 - `input` (positional) reads copied-clip XML from a file path; omit it to read from stdin.
 - `-o, --output FILE` writes rewritten XML to a file; omit it to write to stdout.
-- `--clipboard-in` and `--clipboard-out` read/write XML through the system clipboard.
+- `--clipboard-in` and `--clipboard-out` read/write XML through the system clipboard. Requires `wl-clipboard` or `xclip`/`xsel` on Linux, uses built-in `pbpaste`/`pbcopy` on macOS, and `powershell.exe`/`clip.exe` on Windows.
 - `--det-size WIDTHxHEIGHT` sets detector input size, for example `320x320` for speed or `640x640` for smaller faces.
 - `--model-name MODEL` chooses InsightFace model, for example `buffalo_s` for speed or `buffalo_l` for offline quality.
-- `--provider-mode auto|cuda|rocm|migraphx|cpu`.
-- `auto` tries CUDA first, then ROCm, then CPU; use `migraphx` only if you explicitly want MIGraphX.
+- `--provider-mode auto|cuda|rocm|coreml|openvino|migraphx|cpu`.
+- `auto` tries CUDA, ROCm, CoreML, and OpenVINO in that order before falling back to CPU.
+- Use `coreml` on Apple Silicon for GPU-accelerated inference after installing the `cpu` extra.
+- Use `openvino` on Intel hardware with the `openvino` extra installed.
+- Use `migraphx` only if you explicitly want MIGraphX.
 - `--process-width 0` keeps full source resolution during detection.
 - `--keyframe-fps` limits emitted Kdenlive keyframes while preserving full-rate tracking internally.
 - `--adaptive-keyframes` varies emitted keyframe density by motion speed.
@@ -177,8 +282,11 @@ What this command does:
 
 - If first run fails while fetching models, retry on a machine with network access first so InsightFace can populate its cache.
 - If `--clipboard-in` or `--clipboard-out` fails, switch to file input/output and confirm your clipboard utility is installed.
-- If the tool reports detector initialization failure for CUDA or ROCm, rerun with `--provider-mode cpu` to verify the rest of the workflow.
+- If the tool reports detector initialization failure for CUDA, ROCm, CoreML, OpenVINO, or MIGraphX, rerun with `--provider-mode cpu` to verify the rest of the workflow.
 - If copied XML references media outside the current machine or mount layout, use file-based XML input and correct the source media path in Kdenlive first.
+- If ONNX Runtime import fails entirely, install one runtime extra first: `cpu` for CPU/CoreML, `cuda` for NVIDIA, `rocm` for AMD ROCm, or `openvino` for Intel OpenVINO.
+- If your expected provider is missing in the self-check output, verify you installed the matching extra for that environment and confirm the host driver/runtime installation.
+- On Windows, if clipboard reads fail, check `Get-Clipboard` directly in PowerShell; if clipboard writes fail, verify `clip.exe` is available on `PATH`.
 
 ## ROCm Container Workflow For Kdenlive
 
@@ -369,3 +477,7 @@ If masks were generated with an older tool version, manually set every generated
 - Only copied clip snippets rooted at `<kdenlive-scene>` are supported.
 - Only clips with `speed=1` are supported.
 - Tool only generates mask effects; blur/pixelize/fill effects are added manually in Kdenlive.
+
+## License
+
+This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE).

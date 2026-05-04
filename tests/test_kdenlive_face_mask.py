@@ -1,8 +1,14 @@
 import contextlib
 import io
+import os
+from pathlib import Path
+import sys
+import tempfile
 import unittest
+import unittest.mock
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
+from xml.sax.saxutils import escape
 
 from kdenlive_face_mask import (
     MASK_EFFECT_ID,
@@ -10,11 +16,14 @@ from kdenlive_face_mask import (
     MaskFrame,
     TrackSample,
     build_detector,
+    main,
     map_clip_frame_to_source_frame,
+    read_from_clipboard,
     resolve_scene_context,
     rewrite_scene_with_tracks,
     smooth_track,
     thin_mask_frames,
+    write_to_clipboard,
 )
 
 
@@ -127,6 +136,32 @@ def make_track(track_id: int, frames: range, base_x: float) -> FaceTrack:
     )
 
 
+def make_smoke_scene_xml(resource_path: str, *, frame_count: int, frame_width: int, frame_height: int, fps: float) -> str:
+    out_frame = frame_count - 1
+    return f"""<kdenlive-scene audioTracks=\"0\" documentid=\"1\" duration=\"{out_frame}\" fps=\"{fps}\" mainClip=\"26\" masterTrack=\"1\" offset=\"0\" videoTracks=\"1\">
+ <clip binid=\"4\" id=\"26\" in=\"0\" out=\"{out_frame}\" playlist=\"0\" position=\"0\" speed=\"1.000000\" state=\"1\" track=\"1\">
+  <effects parentIn=\"0\"/>
+ </clip>
+ <bin>
+  <chain id=\"chain0\" out=\"{out_frame}\" type=\"3\">
+   <property name=\"length\">{frame_count}</property>
+   <property name=\"eof\">pause</property>
+   <property name=\"resource\">{escape(resource_path)}</property>
+   <property name=\"mlt_service\">avformat</property>
+   <property name=\"seekable\">1</property>
+   <property name=\"format\">3</property>
+   <property name=\"video_index\">0</property>
+   <property name=\"vstream\">0</property>
+   <property name=\"kdenlive:id\">4</property>
+   <property name=\"meta.media.width\">{frame_width}</property>
+   <property name=\"meta.media.height\">{frame_height}</property>
+  </chain>
+ </bin>
+ <groups>[]</groups>
+</kdenlive-scene>
+"""
+
+
 class ResolveSceneContextTests(unittest.TestCase):
     def test_extracts_resource_and_frame_range(self) -> None:
         context = resolve_scene_context(SCENE_XML)
@@ -139,6 +174,24 @@ class ResolveSceneContextTests(unittest.TestCase):
         self.assertEqual(context.frame_width, 1920)
         self.assertEqual(context.frame_height, 1080)
 
+    def test_resolves_relative_resource_against_input_xml_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir) / "project"
+            project_dir.mkdir()
+            xml_path = project_dir / "copied-clip.xml"
+            xml_text = make_smoke_scene_xml(
+                "media/sample.mp4",
+                frame_count=5,
+                frame_width=64,
+                frame_height=48,
+                fps=30.0,
+            )
+            xml_path.write_text(xml_text, encoding="utf-8")
+
+            context = resolve_scene_context(xml_text, xml_path=xml_path)
+
+        self.assertEqual(project_dir / "media" / "sample.mp4", context.source_path)
+
 
 class SourceFrameMappingTests(unittest.TestCase):
     def test_identity_mapping_when_clip_and_source_fps_match(self) -> None:
@@ -148,6 +201,17 @@ class SourceFrameMappingTests(unittest.TestCase):
         self.assertEqual(0, map_clip_frame_to_source_frame(0, 60.0, 29.97, 436))
         self.assertEqual(218, map_clip_frame_to_source_frame(437, 60.0, 29.97, 436))
         self.assertEqual(436, map_clip_frame_to_source_frame(875, 60.0, 29.97, 436))
+
+
+class RuntimeDependencySmokeTests(unittest.TestCase):
+    def test_installed_onnxruntime_exposes_expected_api(self) -> None:
+        try:
+            import onnxruntime as ort  # type: ignore
+        except ImportError:
+            self.skipTest("onnxruntime is not installed in this environment")
+
+        self.assertTrue(hasattr(ort, "InferenceSession"))
+        self.assertTrue(hasattr(ort, "get_available_providers"))
 
 
 class DetectorInitializationTests(unittest.TestCase):
@@ -267,8 +331,192 @@ class DetectorInitializationTests(unittest.TestCase):
         self.assertEqual(["CUDAExecutionProvider", "CPUExecutionProvider"], detector.providers)
         self.assertEqual("fake-cv2", cv2)
 
+    def test_build_detector_prefers_coreml_in_auto_mode_on_macos(self) -> None:
+        class FakeOrt:
+            @staticmethod
+            def get_available_providers():
+                return ["CPUExecutionProvider", "CoreMLExecutionProvider"]
 
-class RewriteSceneWithTracksTests(unittest.TestCase):
+        class FakeNP:
+            uint8 = object()
+
+            @staticmethod
+            def zeros(_shape, dtype=None):
+                return {"dtype": dtype}
+
+        class FakeFaceAnalysis:
+            def __init__(self, *, name, allowed_modules, providers):
+                self.providers = providers
+
+            def prepare(self, *, ctx_id, det_size):
+                pass
+
+            def get(self, _frame):
+                return []
+
+        with patch(
+            "kdenlive_face_mask._import_detection_modules",
+            return_value=("fake-cv2", FakeNP(), FakeOrt(), FakeFaceAnalysis),
+        ):
+            detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "auto")
+
+        self.assertEqual(["CoreMLExecutionProvider", "CPUExecutionProvider"], providers)
+
+    def test_build_detector_uses_coreml_mode_when_available(self) -> None:
+        class FakeOrt:
+            @staticmethod
+            def get_available_providers():
+                return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+
+        class FakeNP:
+            uint8 = object()
+
+            @staticmethod
+            def zeros(_shape, dtype=None):
+                return {"dtype": dtype}
+
+        class FakeFaceAnalysis:
+            def __init__(self, *, name, allowed_modules, providers):
+                self.providers = providers
+
+            def prepare(self, *, ctx_id, det_size):
+                pass
+
+            def get(self, _frame):
+                return []
+
+        with patch(
+            "kdenlive_face_mask._import_detection_modules",
+            return_value=("fake-cv2", FakeNP(), FakeOrt(), FakeFaceAnalysis),
+        ):
+            detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "coreml")
+
+        self.assertEqual(["CoreMLExecutionProvider", "CPUExecutionProvider"], providers)
+        self.assertEqual(["CoreMLExecutionProvider", "CPUExecutionProvider"], detector.providers)
+
+    def test_build_detector_uses_openvino_mode_when_available(self) -> None:
+        class FakeOrt:
+            @staticmethod
+            def get_available_providers():
+                return ["OpenVINOExecutionProvider", "CPUExecutionProvider"]
+
+        class FakeNP:
+            uint8 = object()
+
+            @staticmethod
+            def zeros(_shape, dtype=None):
+                return {"dtype": dtype}
+
+        class FakeFaceAnalysis:
+            def __init__(self, *, name, allowed_modules, providers):
+                self.providers = providers
+
+            def prepare(self, *, ctx_id, det_size):
+                pass
+
+            def get(self, _frame):
+                return []
+
+        with patch(
+            "kdenlive_face_mask._import_detection_modules",
+            return_value=("fake-cv2", FakeNP(), FakeOrt(), FakeFaceAnalysis),
+        ):
+            detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "openvino")
+
+        self.assertEqual(["OpenVINOExecutionProvider", "CPUExecutionProvider"], providers)
+        self.assertEqual(["OpenVINOExecutionProvider", "CPUExecutionProvider"], detector.providers)
+
+    def test_build_detector_falls_back_to_cpu_when_coreml_unavailable(self) -> None:
+        class FakeOrt:
+            @staticmethod
+            def get_available_providers():
+                return ["CPUExecutionProvider"]
+
+        class FakeNP:
+            uint8 = object()
+
+            @staticmethod
+            def zeros(_shape, dtype=None):
+                return {"dtype": dtype}
+
+        class FakeFaceAnalysis:
+            def __init__(self, *, name, allowed_modules, providers):
+                self.providers = providers
+
+            def prepare(self, *, ctx_id, det_size):
+                pass
+
+            def get(self, _frame):
+                return []
+
+        with patch(
+            "kdenlive_face_mask._import_detection_modules",
+            return_value=("fake-cv2", FakeNP(), FakeOrt(), FakeFaceAnalysis),
+        ):
+            detector, providers, cv2 = build_detector((320, 320), "buffalo_s", "coreml")
+
+        self.assertEqual(["CPUExecutionProvider"], providers)
+
+
+class ClipboardTests(unittest.TestCase):
+    def test_read_from_clipboard_uses_pbpaste_on_macos(self) -> None:
+        def fake_which(cmd: str):
+            return "/usr/bin/pbpaste" if cmd == "pbpaste" else None
+
+        with patch("kdenlive_face_mask.shutil.which", side_effect=fake_which):
+            with patch(
+                "kdenlive_face_mask.subprocess.run",
+                return_value=type("R", (), {"returncode": 0, "stdout": b"<xml/>"})()
+            ):
+                result = read_from_clipboard()
+
+        self.assertEqual("<xml/>", result)
+
+    def test_read_from_clipboard_uses_powershell_on_windows(self) -> None:
+        def fake_which(cmd: str):
+            return r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" if cmd == "powershell.exe" else None
+
+        with patch("kdenlive_face_mask.shutil.which", side_effect=fake_which):
+            with patch(
+                "kdenlive_face_mask.subprocess.run",
+                return_value=type("R", (), {"returncode": 0, "stdout": b"<xml/>"})()
+            ) as mock_run:
+                result = read_from_clipboard()
+
+        self.assertEqual("<xml/>", result)
+        called_cmd = mock_run.call_args[0][0]
+        self.assertEqual("powershell.exe", called_cmd[0])
+        self.assertIn("Get-Clipboard", called_cmd)
+
+    def test_write_to_clipboard_uses_pbcopy_on_macos(self) -> None:
+        def fake_which(cmd: str):
+            return "/usr/bin/pbcopy" if cmd == "pbcopy" else None
+
+        mock_process = unittest.mock.MagicMock()
+        mock_process.communicate.return_value = ("", "")
+        mock_process.returncode = 0
+
+        with patch("kdenlive_face_mask.shutil.which", side_effect=fake_which):
+            with patch("kdenlive_face_mask.subprocess.Popen", return_value=mock_process) as mock_popen:
+                write_to_clipboard("<xml/>")
+
+        called_cmd = mock_popen.call_args[0][0]
+        self.assertEqual(["pbcopy"], called_cmd)
+
+    def test_write_to_clipboard_uses_clip_exe_on_windows(self) -> None:
+        def fake_which(cmd: str):
+            return r"C:\Windows\System32\clip.exe" if cmd == "clip.exe" else None
+
+        mock_process = unittest.mock.MagicMock()
+        mock_process.communicate.return_value = ("", "")
+        mock_process.returncode = 0
+
+        with patch("kdenlive_face_mask.shutil.which", side_effect=fake_which):
+            with patch("kdenlive_face_mask.subprocess.Popen", return_value=mock_process) as mock_popen:
+                write_to_clipboard("<xml/>")
+
+        called_cmd = mock_popen.call_args[0][0]
+        self.assertEqual(["clip.exe"], called_cmd)
     def test_replaces_existing_mask_effects(self) -> None:
         rewritten = rewrite_scene_with_tracks(
             SCENE_XML,
@@ -360,7 +608,7 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
         self.assertEqual(
-            "0=0;1=0.0197917;2=0.0197917;3=0.0197917;4=0.0197917;5=0.0197917;6=0;7=0;8=0.0197917;9=0.0197917;10=0.0197917;11=0.0197917;12=0",
+            "0=0.0197917;1=0.0197917;2=0.0197917;3=0.0197917;4=0.0197917;5=0.0197917;6=0;7=0;8=0.0197917;9=0.0197917;10=0.0197917;11=0.0197917;12=0",
             size_x.text,
         )
 
@@ -382,7 +630,7 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
         self.assertIsNotNone(size_x)
         self.assertEqual("7=0;8=0.0197917;9=0.0197917;10=0.0197917;11=0.0197917;12=0", size_x.text)
 
-    def test_start_of_clip_track_begins_with_zero_size_keyframe(self) -> None:
+    def test_start_of_clip_track_begins_visible_on_frame_zero(self) -> None:
         rewritten = rewrite_scene_with_tracks(
             SCENE_XML,
             [make_track(9, range(0, 3), 420.0)],
@@ -398,7 +646,25 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
-        self.assertEqual("0=0;1=0.0197917;2=0.0197917;3=0", size_x.text)
+        self.assertEqual("0=0.0197917;1=0.0197917;2=0.0197917;3=0", size_x.text)
+
+    def test_single_frame_track_at_clip_start_remains_visible(self) -> None:
+        rewritten = rewrite_scene_with_tracks(
+            SCENE_XML,
+            [make_track(10, range(0, 1), 420.0)],
+            frame_width=1920,
+            frame_height=1080,
+            shape=0.38,
+            tilt=0.5,
+            replace_existing_masks=True,
+        )
+
+        root = ET.fromstring(rewritten)
+        effect = root.find("./clip[@id='15']/effects/effect")
+        self.assertIsNotNone(effect)
+        size_x = effect.find("./property[@name='filter.Size X']")
+        self.assertIsNotNone(size_x)
+        self.assertEqual("0=0.0197917;1=0", size_x.text)
 
     def test_adds_mask_to_empty_video_clip_effects(self) -> None:
         rewritten = rewrite_scene_with_tracks(
@@ -437,7 +703,7 @@ class RewriteSceneWithTracksTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
-        self.assertEqual("0=0;1=0.0197917;5=0.0197917;7=0.0197917;8=0", size_x.text)
+        self.assertEqual("0=0.0197917;4=0.0197917;7=0.0197917;8=0", size_x.text)
 
 
 class KeyframeDensityTests(unittest.TestCase):
@@ -513,6 +779,186 @@ class SmoothTrackTests(unittest.TestCase):
         self.assertEqual(100.0, track.samples[1].cx)
         self.assertEqual(180.0, track.samples[2].cx)
         self.assertEqual(180.0, track.samples[3].cx)
+
+
+class DoctorModeTests(unittest.TestCase):
+    def test_main_doctor_reports_support_and_issue_or_pr_suggestion(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def fake_build_detector(_det_size, _model_name, provider_mode):
+            print(f"probe {provider_mode}", file=sys.stderr)
+            if provider_mode == "cuda":
+                return object(), ["CPUExecutionProvider"], "fake-cv2"
+            if provider_mode == "openvino":
+                return object(), ["OpenVINOExecutionProvider", "CPUExecutionProvider"], "fake-cv2"
+            if provider_mode == "cpu":
+                return object(), ["CPUExecutionProvider"], "fake-cv2"
+            raise AssertionError(f"Unexpected provider mode {provider_mode}")
+
+        with patch(
+            "kdenlive_face_mask.installed_package_version",
+            return_value="0.1.0",
+        ):
+            with patch(
+                "kdenlive_face_mask.detect_host_environment",
+                return_value={
+                    "system": "Windows",
+                    "machine": "AMD64",
+                    "python_version": "3.12.9",
+                    "platform": "Windows-11-10.0.22631-SP0",
+                    "distribution": None,
+                    "distribution_id": None,
+                },
+            ):
+                with patch(
+                    "kdenlive_face_mask.detect_onnxruntime_support",
+                    return_value={
+                        "import_ok": True,
+                        "version": "1.25.1",
+                        "available_providers": [
+                            "CUDAExecutionProvider",
+                            "OpenVINOExecutionProvider",
+                            "CPUExecutionProvider",
+                        ],
+                        "error": None,
+                    },
+                ):
+                    with patch(
+                        "kdenlive_face_mask.detect_clipboard_support",
+                        return_value={
+                            "read_command": "powershell.exe",
+                            "write_command": "clip.exe",
+                            "available_read_commands": ["powershell.exe"],
+                            "available_write_commands": ["clip.exe"],
+                        },
+                    ):
+                        with patch(
+                            "kdenlive_face_mask.build_detector",
+                            side_effect=fake_build_detector,
+                        ):
+                            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                                exit_code = main(["--doctor", "--log-level", "ERROR"])
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("", stderr.getvalue())
+
+        report = stdout.getvalue()
+        self.assertIn("README bucket: Windows (x86_64)", report)
+        self.assertIn("Preferred provider mode on this host: openvino", report)
+        self.assertIn("Provider usability checks:", report)
+        self.assertIn("- cuda: detected but unusable for detector init; fell back to CPUExecutionProvider", report)
+        self.assertIn("- openvino: usable (OpenVINOExecutionProvider, CPUExecutionProvider)", report)
+        self.assertIn("consider opening an issue or a PR", report)
+        self.assertIn(
+            "Suggested issue/PR title: validation report: Windows (x86_64) works on Windows (AMD64)",
+            report,
+        )
+        self.assertIn(
+            "ONNX Runtime providers: CUDAExecutionProvider, OpenVINOExecutionProvider, CPUExecutionProvider",
+            report,
+        )
+
+
+class EndToEndCliSmokeTests(unittest.TestCase):
+    def test_main_rewrites_xml_from_real_video_with_fake_detector(self) -> None:
+        import cv2
+        import numpy as np
+
+        def create_smoke_video(directory: str, frame_count: int) -> str:
+            candidates = [
+                ("smoke.avi", "MJPG"),
+                ("smoke.avi", "XVID"),
+                ("smoke.mp4", "mp4v"),
+            ]
+
+            for file_name, fourcc_code in candidates:
+                video_path = os.path.join(directory, file_name)
+                writer = cv2.VideoWriter(
+                    video_path,
+                    cv2.VideoWriter_fourcc(*fourcc_code),
+                    30.0,
+                    (64, 48),
+                )
+                if not writer.isOpened():
+                    continue
+
+                for frame_index in range(frame_count):
+                    frame = np.full((48, 64, 3), 30 + frame_index * 20, dtype=np.uint8)
+                    writer.write(frame)
+                writer.release()
+
+                capture = cv2.VideoCapture(video_path)
+                ok, _ = capture.read()
+                capture.release()
+                if ok:
+                    return video_path
+
+            self.skipTest("OpenCV could not create a readable smoke-test video on this platform")
+
+        class FakeDetector:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, _frame):
+                offset = float(self.calls)
+                self.calls += 1
+                return [
+                    type(
+                        "FakeFace",
+                        (),
+                        {
+                            "bbox": np.array([14.0 + offset, 10.0, 42.0 + offset, 38.0]),
+                            "det_score": 0.99,
+                            "kps": None,
+                        },
+                    )()
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            video_path = create_smoke_video(tmp_dir, frame_count=5)
+            input_path = os.path.join(tmp_dir, "copied-clip.xml")
+            output_path = os.path.join(tmp_dir, "rewritten-clip.xml")
+
+            with open(input_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    make_smoke_scene_xml(
+                        video_path,
+                        frame_count=5,
+                        frame_width=64,
+                        frame_height=48,
+                        fps=30.0,
+                    )
+                )
+
+            with patch(
+                "kdenlive_face_mask.build_detector",
+                return_value=(FakeDetector(), ["CPUExecutionProvider"], cv2),
+            ):
+                exit_code = main(
+                    [
+                        input_path,
+                        "--output",
+                        output_path,
+                        "--provider-mode",
+                        "cpu",
+                        "--progress-every",
+                        "0",
+                        "--log-level",
+                        "ERROR",
+                    ]
+                )
+
+            with open(output_path, "r", encoding="utf-8") as handle:
+                rewritten = handle.read()
+
+        self.assertEqual(0, exit_code)
+
+        root = ET.fromstring(rewritten)
+        effects = root.findall("./clip[@id='26']/effects/effect")
+        self.assertEqual(1, len(effects))
+        self.assertEqual(MASK_EFFECT_ID, effects[0].attrib.get("id"))
+        self.assertIsNotNone(effects[0].find("./property[@name='filter.Position X']"))
 
 
 if __name__ == "__main__":

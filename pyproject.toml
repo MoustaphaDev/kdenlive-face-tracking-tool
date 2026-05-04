@@ -5,13 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kdenlive-face-tracking-tool"
 version = "0.1.0"
-description = "Offline Kdenlive face-tracking mask generator"
+description = "Offline Kdenlive face-tracking mask generator with a CPU-first workflow and optional CUDA, ROCm, CoreML, and OpenVINO acceleration where host runtimes support it"
+license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.12"
 keywords = ["kdenlive", "face-tracking", "video", "opencv", "onnxruntime"]
 classifiers = [
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Environment :: Console",
     "Topic :: Multimedia :: Video",
 ]
@@ -19,18 +22,23 @@ dependencies = [
     "numpy>=2.2.2",
     "opencv-python>=4.10.0.84",
     "insightface>=0.7.3",
-    "onnxruntime>=1.20.1",
 ]
 
 [project.scripts]
 kdenlive-face-mask = "kdenlive_face_mask:main"
 
 [project.optional-dependencies]
+cpu = [
+    "onnxruntime>=1.24.1,<1.25",
+]
 cuda = [
     "onnxruntime-gpu>=1.20.1",
 ]
 rocm = [
     "onnxruntime-rocm>=1.20.1",
+]
+openvino = [
+    "onnxruntime-openvino>=1.20.1",
 ]
 
 [tool.setuptools]

@@ -4,15 +4,18 @@ from __future__ import annotations
 import argparse
 import contextlib
 import heapq
+import io
 import logging
 import math
+import platform
 import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from importlib import metadata
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 LOG = logging.getLogger("kdenlive-face-mask")
 
@@ -27,6 +30,35 @@ MASK_OPERATION_WRITE_ON_CLEAR = "0"
 MASK_OPERATION_MAX = "0.3"
 MODERATE_POSITION_MOTION_RATIO = 0.06
 FAST_POSITION_MOTION_RATIO = 0.12
+
+READ_CLIPBOARD_COMMANDS = [
+    ["wl-paste", "--no-newline", "--type", "text/plain;charset=utf-8"],
+    ["wl-paste", "--no-newline", "--type", "text/plain"],
+    ["wl-paste", "--no-newline"],
+    ["xclip", "-selection", "clipboard", "-out"],
+    ["xsel", "--clipboard", "--output"],
+    ["pbpaste"],
+    ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
+]
+
+WRITE_CLIPBOARD_COMMANDS = [
+    ["wl-copy"],
+    ["xclip", "-selection", "clipboard", "-in"],
+    ["xsel", "--clipboard", "--input"],
+    ["pbcopy"],
+    ["clip.exe"],
+]
+
+PROVIDER_MODE_TO_ORT_PROVIDER = {
+    "cuda": "CUDAExecutionProvider",
+    "rocm": "ROCMExecutionProvider",
+    "migraphx": "MIGraphXExecutionProvider",
+    "coreml": "CoreMLExecutionProvider",
+    "openvino": "OpenVINOExecutionProvider",
+    "cpu": "CPUExecutionProvider",
+}
+
+DOCTOR_PROVIDER_PROBE_ORDER = ["cuda", "rocm", "coreml", "openvino", "migraphx", "cpu"]
 
 
 @dataclass
@@ -171,8 +203,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--provider-mode",
         default="auto",
-        choices=("auto", "cuda", "rocm", "migraphx", "cpu"),
-        help="ONNX Runtime provider preference. auto tries CUDA, then ROCm, then CPU.",
+        choices=("auto", "cuda", "rocm", "migraphx", "coreml", "openvino", "cpu"),
+        help="ONNX Runtime provider preference. auto tries CUDA, ROCm, CoreML, OpenVINO, then CPU.",
     )
     parser.add_argument(
         "--det-size",
@@ -253,11 +285,368 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         help="Logging verbosity.",
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Print environment diagnostics and exit without processing clip XML.",
+    )
     return parser.parse_args(argv)
 
 
 def configure_logging(level_name: str) -> None:
     logging.basicConfig(level=getattr(logging, level_name), format="[maskgen] %(levelname)s: %(message)s")
+
+
+def installed_package_version() -> str:
+    try:
+        return metadata.version("kdenlive-face-tracking-tool")
+    except metadata.PackageNotFoundError:
+        return "0+unknown"
+
+
+def unique_available_commands(commands: Sequence[Sequence[str]]) -> list[str]:
+    available: list[str] = []
+    seen: set[str] = set()
+    for command in commands:
+        command_name = command[0]
+        if command_name in seen:
+            continue
+        if shutil.which(command_name) is None:
+            continue
+        available.append(command_name)
+        seen.add(command_name)
+    return available
+
+
+def detect_clipboard_support() -> dict[str, Any]:
+    read_commands = unique_available_commands(READ_CLIPBOARD_COMMANDS)
+    write_commands = unique_available_commands(WRITE_CLIPBOARD_COMMANDS)
+    return {
+        "read_command": read_commands[0] if read_commands else None,
+        "write_command": write_commands[0] if write_commands else None,
+        "available_read_commands": read_commands,
+        "available_write_commands": write_commands,
+    }
+
+
+def detect_host_environment() -> dict[str, str | None]:
+    system_name = platform.system() or sys.platform
+    machine = platform.machine() or "unknown"
+    distribution = None
+    distribution_id = None
+
+    if system_name == "Linux":
+        try:
+            os_release = platform.freedesktop_os_release()
+        except Exception:
+            os_release = {}
+        distribution = os_release.get("PRETTY_NAME") or os_release.get("NAME")
+        distribution_id = os_release.get("ID")
+
+    return {
+        "system": system_name,
+        "machine": machine,
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "distribution": distribution,
+        "distribution_id": distribution_id,
+    }
+
+
+def detect_onnxruntime_support() -> dict[str, Any]:
+    try:
+        import onnxruntime as ort  # type: ignore
+    except ImportError as exc:
+        return {
+            "import_ok": False,
+            "version": None,
+            "available_providers": [],
+            "error": f"{exc.__class__.__name__}: {exc}",
+        }
+
+    try:
+        providers = list(ort.get_available_providers())
+    except Exception as exc:
+        return {
+            "import_ok": True,
+            "version": getattr(ort, "__version__", None),
+            "available_providers": [],
+            "error": f"{exc.__class__.__name__}: {exc}",
+        }
+
+    return {
+        "import_ok": True,
+        "version": getattr(ort, "__version__", None),
+        "available_providers": providers,
+        "error": None,
+    }
+
+
+def preferred_provider_mode(available_providers: Sequence[str]) -> str | None:
+    provider_order = [
+        ("CUDAExecutionProvider", "cuda"),
+        ("ROCMExecutionProvider", "rocm"),
+        ("CoreMLExecutionProvider", "coreml"),
+        ("OpenVINOExecutionProvider", "openvino"),
+        ("MIGraphXExecutionProvider", "migraphx"),
+        ("CPUExecutionProvider", "cpu"),
+    ]
+    for provider_name, provider_mode in provider_order:
+        if provider_name in available_providers:
+            return provider_mode
+    return None
+
+
+def doctor_probe_modes(available_providers: Sequence[str]) -> list[str]:
+    modes: list[str] = []
+    for provider_mode in DOCTOR_PROVIDER_PROBE_ORDER:
+        provider_name = PROVIDER_MODE_TO_ORT_PROVIDER[provider_mode]
+        if provider_name in available_providers:
+            modes.append(provider_mode)
+    return modes
+
+
+def probe_provider_mode(det_size: tuple[int, int], model_name: str, provider_mode: str) -> dict[str, Any]:
+    requested_provider = PROVIDER_MODE_TO_ORT_PROVIDER[provider_mode]
+    previous_level = LOG.level
+    try:
+        # Doctor probes are expected to encounter unusable provider setups;
+        # keep those failures in the report instead of warning on stderr.
+        LOG.setLevel(max(previous_level, logging.ERROR))
+        with contextlib.redirect_stderr(io.StringIO()):
+            _detector, active_providers, _cv2 = build_detector(det_size, model_name, provider_mode)
+    except Exception as exc:
+        return {
+            "mode": provider_mode,
+            "requested_provider": requested_provider,
+            "status": "failed",
+            "active_providers": [],
+            "error": f"{exc.__class__.__name__}: {exc}",
+        }
+    finally:
+        LOG.setLevel(previous_level)
+
+    if requested_provider in active_providers:
+        status = "usable"
+    elif provider_mode != "cpu" and "CPUExecutionProvider" in active_providers:
+        status = "fallback-to-cpu"
+    else:
+        status = "initialized-with-different-provider"
+
+    return {
+        "mode": provider_mode,
+        "requested_provider": requested_provider,
+        "status": status,
+        "active_providers": list(active_providers),
+        "error": None,
+    }
+
+
+def probe_provider_usability(det_size: tuple[int, int], model_name: str, available_providers: Sequence[str]) -> list[dict[str, Any]]:
+    return [probe_provider_mode(det_size, model_name, provider_mode) for provider_mode in doctor_probe_modes(available_providers)]
+
+
+def preferred_usable_provider_mode(provider_probes: Sequence[dict[str, Any]]) -> str | None:
+    for provider_mode in DOCTOR_PROVIDER_PROBE_ORDER:
+        for probe in provider_probes:
+            if probe["mode"] == provider_mode and probe["status"] == "usable":
+                return provider_mode
+    return None
+
+
+def format_provider_probe_for_report(probe: dict[str, Any]) -> str:
+    active_providers = ", ".join(probe["active_providers"]) if probe["active_providers"] else "none"
+    if probe["status"] == "usable":
+        return f"- {probe['mode']}: usable ({active_providers})"
+    if probe["status"] == "fallback-to-cpu":
+        return f"- {probe['mode']}: detected but unusable for detector init; fell back to {active_providers}"
+    return f"- {probe['mode']}: failed ({probe['error']})"
+
+
+def format_provider_probe_for_issue_body(probe: dict[str, Any]) -> str:
+    active_providers = ", ".join(probe["active_providers"]) if probe["active_providers"] else "none"
+    if probe["status"] == "usable":
+        return f"- {probe['mode']}: usable ({active_providers})"
+    if probe["status"] == "fallback-to-cpu":
+        return f"- {probe['mode']}: detected but unusable for detector init; fell back to {active_providers}"
+    return f"- {probe['mode']}: failed ({probe['error']})"
+
+
+def support_assessment_for_host(host: dict[str, str | None]) -> dict[str, Any]:
+    system_name = (host["system"] or "").lower()
+    machine = (host["machine"] or "").lower()
+
+    if system_name == "linux" and machine in {"x86_64", "amd64"}:
+        return {
+            "readme_label": "Linux (x86_64)",
+            "status": "expected-with-partial-real-world-validation",
+            "summary": "Documented in the README and partially validated, but broad hardware coverage is still unverified.",
+            "should_suggest_report": True,
+        }
+
+    if system_name == "windows" and machine in {"x86_64", "amd64"}:
+        return {
+            "readme_label": "Windows (x86_64)",
+            "status": "expected-with-ci-smoke-coverage",
+            "summary": "Documented in the README with CI smoke coverage, but not yet hardware-validated by the project.",
+            "should_suggest_report": True,
+        }
+
+    if system_name == "darwin" and machine in {"arm64", "aarch64"}:
+        return {
+            "readme_label": "macOS (Apple Silicon)",
+            "status": "expected-but-unverified",
+            "summary": "Documented in the README as expected to work, but not yet hardware-validated by the project.",
+            "should_suggest_report": True,
+        }
+
+    if system_name == "darwin" and machine in {"x86_64", "amd64"}:
+        return {
+            "readme_label": "macOS (Intel)",
+            "status": "unsupported-by-documented-install-path",
+            "summary": "The README currently treats Intel macOS as unsupported by the documented install path.",
+            "should_suggest_report": False,
+        }
+
+    return {
+        "readme_label": "Not listed in README",
+        "status": "not-listed",
+        "summary": "This host is not currently described in the README compatibility matrix.",
+        "should_suggest_report": True,
+    }
+
+
+def host_display_name(host: dict[str, str | None]) -> str:
+    distribution = host.get("distribution")
+    if distribution:
+        return f"{distribution} ({host['machine']})"
+    return f"{host['system']} ({host['machine']})"
+
+
+def build_report_suggestion(
+    host: dict[str, str | None],
+    support: dict[str, Any],
+    available_providers: Sequence[str],
+    provider_probes: Sequence[dict[str, Any]],
+) -> dict[str, str] | None:
+    if not support.get("should_suggest_report"):
+        return None
+
+    recommended_mode = preferred_usable_provider_mode(provider_probes) or preferred_provider_mode(available_providers) or "cpu"
+    provider_text = ", ".join(available_providers) if available_providers else "none detected"
+    provider_probe_lines = [format_provider_probe_for_issue_body(probe) for probe in provider_probes]
+    title = f"validation report: {support['readme_label']} works on {host_display_name(host)}"
+    body = "\n".join(
+        [
+            "## Validation report",
+            f"- Host: {host_display_name(host)}",
+            f"- Python: {host['python_version']}",
+            f"- ONNX Runtime providers: {provider_text}",
+            f"- Recommended provider mode on this host: {recommended_mode}",
+            "- Validation performed: end-to-end real clip run",
+            "",
+            "## Provider usability checks",
+            *provider_probe_lines,
+            "",
+            "## Requested follow-up",
+            "- [ ] Please confirm whether this should be reflected in the README validation status.",
+            "- [ ] Please mention whether this belongs in an issue or a PR.",
+            "",
+            "## Notes",
+            "- Please mention whether CPU mode worked.",
+            "- If you validated GPU acceleration, include the provider mode and driver/runtime details.",
+            "- Include whether you tested file I/O, clipboard I/O, or both.",
+        ]
+    )
+    return {
+        "title": title,
+        "body": body,
+    }
+
+
+def build_doctor_report(args: argparse.Namespace) -> dict[str, Any]:
+    host = detect_host_environment()
+    onnxruntime_support = detect_onnxruntime_support()
+    support = support_assessment_for_host(host)
+    available_providers: list[str] = list(onnxruntime_support["available_providers"])
+    det_size = parse_det_size(args.det_size)
+    provider_probes = probe_provider_usability(det_size, args.model_name, available_providers) if onnxruntime_support["import_ok"] else []
+    recommended_mode = preferred_usable_provider_mode(provider_probes) or preferred_provider_mode(available_providers) or "cpu"
+
+    return {
+        "tool": {
+            "name": "kdenlive-face-mask",
+            "version": installed_package_version(),
+        },
+        "host": host,
+        "support": support,
+        "onnxruntime": onnxruntime_support,
+        "provider_probes": provider_probes,
+        "clipboard": detect_clipboard_support(),
+        "recommendations": {
+            "first_run_provider_mode": "cpu",
+            "preferred_provider_mode": recommended_mode,
+        },
+        "contribution": {
+            "should_report_if_successful": bool(support.get("should_suggest_report")),
+            "suggested_issue_or_pr": build_report_suggestion(host, support, available_providers, provider_probes),
+        },
+    }
+
+
+def format_doctor_report(report: dict[str, Any]) -> str:
+    tool: dict[str, Any] = report["tool"]
+    host: dict[str, str | None] = report["host"]
+    support: dict[str, Any] = report["support"]
+    onnxruntime_support: dict[str, Any] = report["onnxruntime"]
+    provider_probes: list[dict[str, Any]] = list(report["provider_probes"])
+    clipboard: dict[str, Any] = report["clipboard"]
+    recommendations: dict[str, Any] = report["recommendations"]
+    contribution: dict[str, Any] = report["contribution"]
+    suggested_report: dict[str, str] | None = contribution["suggested_issue_or_pr"]
+    providers: list[str] = list(onnxruntime_support["available_providers"])
+
+    lines = [
+        f"{tool['name']} doctor",
+        f"Version: {tool['version']}",
+        f"Host: {host_display_name(host)}",
+        f"Python: {host['python_version']}",
+        f"Platform: {host['platform']}",
+        f"README bucket: {support['readme_label']}",
+        f"Support status: {support['status']}",
+        f"Support summary: {support['summary']}",
+        f"ONNX Runtime import: {'ok' if onnxruntime_support['import_ok'] else 'failed'}",
+        f"ONNX Runtime version: {onnxruntime_support['version'] or 'unknown'}",
+        f"Available providers: {', '.join(providers) if providers else 'none'}",
+        f"Clipboard read command: {clipboard['read_command'] or 'none'}",
+        f"Clipboard write command: {clipboard['write_command'] or 'none'}",
+        f"Suggested first run provider mode: {recommendations['first_run_provider_mode']}",
+        f"Preferred provider mode on this host: {recommendations['preferred_provider_mode']}",
+    ]
+
+    if provider_probes:
+        lines.extend(
+            [
+                "Provider usability checks:",
+                *[format_provider_probe_for_report(probe) for probe in provider_probes],
+            ]
+        )
+
+    if onnxruntime_support["error"]:
+        lines.append(f"ONNX Runtime error: {onnxruntime_support['error']}")
+
+    if contribution["should_report_if_successful"] and suggested_report is not None:
+        lines.extend(
+            [
+                "",
+                "If you successfully process a real clip on this host and the README still marks it as untested or does not list it, consider opening an issue or a PR.",
+                f"Suggested issue/PR title: {suggested_report['title']}",
+                "Suggested issue/PR body:",
+                suggested_report["body"],
+            ]
+        )
+
+    return "\n".join(lines)
 
 
 def parse_det_size(value: str) -> tuple[int, int]:
@@ -304,13 +693,15 @@ def parse_float(value: str | None, field_name: str) -> float:
         raise ValueError(f"Expected float {field_name}, got {value!r}") from exc
 
 
-def resolve_source_path(root: ET.Element, resource: str) -> Path:
+def resolve_source_path(root: ET.Element, resource: str, xml_path: Path | None = None) -> Path:
     path = Path(resource).expanduser()
     if path.is_absolute():
         return path
     scene_root = root.attrib.get("root")
     if scene_root:
         return (Path(scene_root).expanduser() / path).resolve()
+    if xml_path is not None:
+        return (xml_path.expanduser().resolve().parent / path).resolve()
     return path.resolve()
 
 
@@ -343,7 +734,7 @@ def find_bin_producer(root: ET.Element, bin_id: str) -> ET.Element:
     raise ValueError(f"No bin producer found for kdenlive:id={bin_id}")
 
 
-def resolve_scene_context(xml_text: str) -> SceneContext:
+def resolve_scene_context(xml_text: str, xml_path: Path | None = None) -> SceneContext:
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
@@ -378,7 +769,7 @@ def resolve_scene_context(xml_text: str) -> SceneContext:
     return SceneContext(
         root=root,
         video_clip=clip,
-        source_path=resolve_source_path(root, resource),
+        source_path=resolve_source_path(root, resource, xml_path),
         fps=fps,
         in_frame=in_frame,
         out_frame=out_frame,
@@ -583,6 +974,10 @@ def build_detector(det_size: tuple[int, int], model_name: str, provider_mode: st
             provider_sets.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
         if "ROCMExecutionProvider" in available:
             provider_sets.append(["ROCMExecutionProvider", "CPUExecutionProvider"])
+        if "CoreMLExecutionProvider" in available:
+            provider_sets.append(["CoreMLExecutionProvider", "CPUExecutionProvider"])
+        if "OpenVINOExecutionProvider" in available:
+            provider_sets.append(["OpenVINOExecutionProvider", "CPUExecutionProvider"])
         provider_sets.append(["CPUExecutionProvider"])
     elif provider_mode == "cuda":
         if "CUDAExecutionProvider" in available:
@@ -595,6 +990,14 @@ def build_detector(det_size: tuple[int, int], model_name: str, provider_mode: st
     elif provider_mode == "migraphx":
         if "MIGraphXExecutionProvider" in available:
             provider_sets.append(["MIGraphXExecutionProvider", "CPUExecutionProvider"])
+        provider_sets.append(["CPUExecutionProvider"])
+    elif provider_mode == "coreml":
+        if "CoreMLExecutionProvider" in available:
+            provider_sets.append(["CoreMLExecutionProvider", "CPUExecutionProvider"])
+        provider_sets.append(["CPUExecutionProvider"])
+    elif provider_mode == "openvino":
+        if "OpenVINOExecutionProvider" in available:
+            provider_sets.append(["OpenVINOExecutionProvider", "CPUExecutionProvider"])
         provider_sets.append(["CPUExecutionProvider"])
     elif provider_mode == "cpu":
         provider_sets.append(["CPUExecutionProvider"])
@@ -774,18 +1177,11 @@ def build_mask_frames(track: FaceTrack, total_frames: int, frame_width: int, fra
         first = sample_by_frame[segment_start]
         last = sample_by_frame[segment_end]
 
-        if segment_start == 0:
-            frames[0] = normalized(first, frame_index=0, zero_size=True)
-        else:
+        if segment_start > 0:
             frames[segment_start - 1] = normalized(first, frame_index=segment_start - 1, zero_size=True)
 
         for frame_index in segment:
-            if segment_start == 0 and frame_index == 0:
-                continue
             frames[frame_index] = normalized(sample_by_frame[frame_index])
-
-        if segment_start == 0 and len(segment) == 1 and total_frames > 1:
-            frames[1] = normalized(first, frame_index=1)
 
         if segment_end < total_frames - 1:
             frames[segment_end + 1] = normalized(last, frame_index=segment_end + 1, zero_size=True)
@@ -1082,14 +1478,7 @@ def write_text_output(text: str, args: argparse.Namespace) -> None:
 
 
 def read_from_clipboard() -> str:
-    commands = [
-        ["wl-paste", "--no-newline", "--type", "text/plain;charset=utf-8"],
-        ["wl-paste", "--no-newline", "--type", "text/plain"],
-        ["wl-paste", "--no-newline"],
-        ["xclip", "-selection", "clipboard", "-out"],
-        ["xsel", "--clipboard", "--output"],
-    ]
-    for command in commands:
+    for command in READ_CLIPBOARD_COMMANDS:
         if shutil.which(command[0]) is None:
             continue
         result = subprocess.run(command, capture_output=True, check=False)
@@ -1098,16 +1487,11 @@ def read_from_clipboard() -> str:
                 return result.stdout.decode("utf-8")
             except UnicodeDecodeError:
                 continue
-    raise RuntimeError("Unable to read clipboard. Install wl-clipboard, xclip, or xsel.")
+    raise RuntimeError("Unable to read clipboard. Install wl-clipboard or xclip/xsel (Linux), or use pbpaste (macOS). On Windows, ensure PowerShell is available.")
 
 
 def write_to_clipboard(text: str) -> None:
-    commands = [
-        ["wl-copy"],
-        ["xclip", "-selection", "clipboard", "-in"],
-        ["xsel", "--clipboard", "--input"],
-    ]
-    for command in commands:
+    for command in WRITE_CLIPBOARD_COMMANDS:
         if shutil.which(command[0]) is None:
             continue
         try:
@@ -1133,7 +1517,7 @@ def write_to_clipboard(text: str) -> None:
 
         if stderr:
             LOG.debug("Clipboard command %s failed: %s", command[0], stderr.strip())
-    raise RuntimeError("Unable to write clipboard. Install wl-clipboard, xclip, or xsel.")
+    raise RuntimeError("Unable to write clipboard. Install wl-clipboard or xclip/xsel (Linux), or use pbcopy (macOS). On Windows, clip.exe should be available by default.")
 
 
 def generate_tracks(context: SceneContext, args: argparse.Namespace) -> tuple[list[FaceTrack], int, int, list[str]]:
@@ -1170,8 +1554,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(args.log_level)
 
     try:
+        if args.doctor:
+            doctor_report = build_doctor_report(args)
+            output_text = format_doctor_report(doctor_report)
+            write_text_output(output_text, args)
+            return 0
+
         xml_text = read_text_input(args)
-        context = resolve_scene_context(xml_text)
+        xml_path = Path(args.input).expanduser() if args.input and not args.clipboard_in else None
+        context = resolve_scene_context(xml_text, xml_path=xml_path)
         tracks, frame_width, frame_height, providers = generate_tracks(context, args)
         LOG.info(
             "Generated %s tracks across %s frames from %s using providers=%s",

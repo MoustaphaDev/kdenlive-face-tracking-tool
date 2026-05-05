@@ -115,7 +115,6 @@ Real-world testing so far is limited to my own machine, an AMD 8745HS APU system
 
 - [Setup and Support](docs/setup-and-support.md): install modes, compatibility matrix, doctor mode, troubleshooting, and ROCm container workflow.
 - [Usage Guide](docs/usage.md): CLI workflows, flags, example commands, and Kdenlive masking tutorials.
-- [Release Checklist](RELEASE.md): maintainer release steps.
 
 ## License
 

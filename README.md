@@ -1,5 +1,9 @@
 # Kdenlive Face Tracking Tool
 
+> [!WARNING]
+> 🧪 Experimental: this project is still new and not yet broadly battle-tested.
+> Expect rough edges, validate the generated masks before relying on them, and plan for some manual cleanup in Kdenlive, especially on blurry footage or less-tested platform and provider combinations.
+
 Automate face-mask tracking in Kdenlive so you spend less time keyframing by hand.
 
 If Kdenlive's built-in motion tracking does not stay glued to faces well enough for your footage, or manual masking would take forever, this tool gives you a fast first pass. It generates tracked `Alpha shapes (Mask)` effects from copied clip XML so you can polish a few misses instead of animating every face from scratch.

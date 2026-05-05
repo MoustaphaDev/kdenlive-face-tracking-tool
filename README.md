@@ -1,8 +1,8 @@
 # Kdenlive Face Tracking Tool
 
 > [!WARNING]
-> 🧪 Experimental: this project is still new and not yet broadly battle-tested.
-> Expect rough edges, validate the generated masks before relying on them, and plan for some manual cleanup in Kdenlive, especially on blurry footage or less-tested platform and provider combinations.
+>> 🧪 Experimental: this project is still new and not yet broadly battle-tested.
+>> Expect rough edges, validate the generated masks before relying on them, and plan for some manual cleanup in Kdenlive, especially on blurry footage or less-tested platform and provider combinations.
 
 Automate face-mask tracking in Kdenlive so you spend less time keyframing by hand.
 

@@ -24,6 +24,11 @@ DEFAULT_SHAPE = 0.38
 DEFAULT_TILT = 0.5
 DEFAULT_PROGRESS_EVERY = 120
 DEFAULT_MIN_KEYFRAME_FPS = 12.0
+ADAPTIVE_DETECT_EVERY = "adaptive"
+ADAPTIVE_DETECT_EVERY_DEFAULT = 2
+ADAPTIVE_DETECT_EVERY_MAX = 3
+ADAPTIVE_DETECT_MOTION_RATIO_LOW = 0.012
+ADAPTIVE_DETECT_MOTION_RATIO_HIGH = 0.05
 ADAPTIVE_KEYFRAME_MOTION_RATIO_LOW = 0.012
 ADAPTIVE_KEYFRAME_MOTION_RATIO_HIGH = 0.05
 MASK_OPERATION_WRITE_ON_CLEAR = "0"
@@ -135,13 +140,58 @@ class TrackSample:
         )
 
 
+@dataclass(frozen=True)
+class Kalman1D:
+    value: float
+    velocity: float = 0.0
+    covariance_pos: float = 1.0
+    covariance_pos_vel: float = 0.0
+    covariance_vel: float = 1.0
+
+    def predict(self, frame_delta: int, accel_variance: float) -> Kalman1D:
+        if frame_delta <= 0:
+            return self
+
+        dt = float(frame_delta)
+        q00 = accel_variance * (dt**4) * 0.25
+        q01 = accel_variance * (dt**3) * 0.5
+        q11 = accel_variance * (dt**2)
+        return Kalman1D(
+            value=self.value + self.velocity * dt,
+            velocity=self.velocity,
+            covariance_pos=self.covariance_pos + dt * (self.covariance_pos_vel + self.covariance_pos_vel) + dt * dt * self.covariance_vel + q00,
+            covariance_pos_vel=self.covariance_pos_vel + dt * self.covariance_vel + q01,
+            covariance_vel=self.covariance_vel + q11,
+        )
+
+    def update(self, measurement: float, measurement_variance: float) -> Kalman1D:
+        innovation = measurement - self.value
+        innovation_covariance = max(self.covariance_pos + measurement_variance, 1e-6)
+        gain_pos = self.covariance_pos / innovation_covariance
+        gain_vel = self.covariance_pos_vel / innovation_covariance
+        previous_covariance_pos_vel = self.covariance_pos_vel
+        return Kalman1D(
+            value=self.value + gain_pos * innovation,
+            velocity=self.velocity + gain_vel * innovation,
+            covariance_pos=max((1.0 - gain_pos) * self.covariance_pos, 1e-6),
+            covariance_pos_vel=(1.0 - gain_pos) * previous_covariance_pos_vel,
+            covariance_vel=max(self.covariance_vel - gain_vel * previous_covariance_pos_vel, 1e-6),
+        )
+
+
 @dataclass
 class FaceTrack:
     track_id: int
     samples: list[TrackSample] = field(default_factory=list)
+    prediction_mode: str = "velocity"
     vx: float = 0.0
     vy: float = 0.0
     miss_count: int = 0
+    filter_frame_index: int | None = None
+    center_x_filter: Kalman1D | None = None
+    center_y_filter: Kalman1D | None = None
+    half_w_filter: Kalman1D | None = None
+    half_h_filter: Kalman1D | None = None
 
     def first_frame(self) -> int:
         return self.samples[0].frame_index
@@ -155,7 +205,104 @@ class FaceTrack:
     def real_sample_count(self) -> int:
         return sum(1 for sample in self.samples if not sample.synthetic)
 
+    def _kalman_scale(self, sample: TrackSample | None = None) -> float:
+        reference = sample if sample is not None else self.samples[-1]
+        return max(reference.half_w, reference.half_h, 1.0)
+
+    def _kalman_position_process_variance(self, scale: float) -> float:
+        return max(scale * 0.18, 0.5) ** 2
+
+    def _kalman_position_measurement_variance(self, scale: float) -> float:
+        return max(scale * 0.35, 1.0) ** 2
+
+    def _kalman_size_process_variance(self, scale: float) -> float:
+        return max(scale * 0.08, 0.25) ** 2
+
+    def _kalman_size_measurement_variance(self, scale: float) -> float:
+        return max(scale * 0.2, 0.5) ** 2
+
+    def _initialize_kalman_filters(self, sample: TrackSample) -> None:
+        scale = self._kalman_scale(sample)
+        position_variance = self._kalman_position_measurement_variance(scale)
+        size_variance = self._kalman_size_measurement_variance(scale)
+        self.center_x_filter = Kalman1D(sample.cx, covariance_pos=position_variance, covariance_vel=position_variance)
+        self.center_y_filter = Kalman1D(sample.cy, covariance_pos=position_variance, covariance_vel=position_variance)
+        self.half_w_filter = Kalman1D(sample.half_w, covariance_pos=size_variance, covariance_vel=size_variance)
+        self.half_h_filter = Kalman1D(sample.half_h, covariance_pos=size_variance, covariance_vel=size_variance)
+        self.filter_frame_index = sample.frame_index
+        self.vx = 0.0
+        self.vy = 0.0
+
+    def _ensure_kalman_filters(self) -> None:
+        if self.prediction_mode != "kalman" or self.center_x_filter is not None or not self.samples:
+            return
+
+        self._initialize_kalman_filters(self.samples[0])
+        for sample in self.samples[1:]:
+            self._apply_kalman_prediction(sample.frame_index)
+            if not sample.synthetic:
+                self._apply_kalman_measurement(sample)
+
+    def _predict_kalman_filters(self, frame_index: int) -> tuple[Kalman1D, Kalman1D, Kalman1D, Kalman1D]:
+        self._ensure_kalman_filters()
+        if self.center_x_filter is None or self.filter_frame_index is None:
+            raise RuntimeError("Kalman filters are unavailable for an empty track")
+        if self.center_y_filter is None or self.half_w_filter is None or self.half_h_filter is None:
+            raise RuntimeError("Kalman filters are partially initialized")
+
+        frame_delta = max(0, frame_index - self.filter_frame_index)
+        scale = self._kalman_scale()
+        center_x_filter = self.center_x_filter
+        center_y_filter = self.center_y_filter
+        half_w_filter = self.half_w_filter
+        half_h_filter = self.half_h_filter
+        return (
+            center_x_filter.predict(frame_delta, self._kalman_position_process_variance(scale)),
+            center_y_filter.predict(frame_delta, self._kalman_position_process_variance(scale)),
+            half_w_filter.predict(frame_delta, self._kalman_size_process_variance(scale)),
+            half_h_filter.predict(frame_delta, self._kalman_size_process_variance(scale)),
+        )
+
+    def _apply_kalman_prediction(self, frame_index: int) -> None:
+        predicted_x, predicted_y, predicted_half_w, predicted_half_h = self._predict_kalman_filters(frame_index)
+        self.center_x_filter = predicted_x
+        self.center_y_filter = predicted_y
+        self.half_w_filter = predicted_half_w
+        self.half_h_filter = predicted_half_h
+        self.filter_frame_index = frame_index
+        self.vx = predicted_x.velocity
+        self.vy = predicted_y.velocity
+
+    def _apply_kalman_measurement(self, sample: TrackSample) -> None:
+        if self.center_x_filter is None or self.center_y_filter is None or self.half_w_filter is None or self.half_h_filter is None:
+            raise RuntimeError("Kalman filters are unavailable for measurement updates")
+        scale = self._kalman_scale(sample)
+        center_x_filter = self.center_x_filter
+        center_y_filter = self.center_y_filter
+        half_w_filter = self.half_w_filter
+        half_h_filter = self.half_h_filter
+        self.center_x_filter = center_x_filter.update(sample.cx, self._kalman_position_measurement_variance(scale))
+        self.center_y_filter = center_y_filter.update(sample.cy, self._kalman_position_measurement_variance(scale))
+        self.half_w_filter = half_w_filter.update(sample.half_w, self._kalman_size_measurement_variance(scale))
+        self.half_h_filter = half_h_filter.update(sample.half_h, self._kalman_size_measurement_variance(scale))
+        self.filter_frame_index = sample.frame_index
+        self.vx = self.center_x_filter.velocity
+        self.vy = self.center_y_filter.velocity
+
     def predict_sample(self, frame_index: int) -> TrackSample:
+        if self.prediction_mode == "kalman":
+            predicted_x, predicted_y, predicted_half_w, predicted_half_h = self._predict_kalman_filters(frame_index)
+            last = self.samples[-1]
+            return TrackSample(
+                frame_index=frame_index,
+                cx=predicted_x.value,
+                cy=predicted_y.value,
+                half_w=max(1.0, predicted_half_w.value),
+                half_h=max(1.0, predicted_half_h.value),
+                angle_deg=last.angle_deg,
+                synthetic=True,
+            )
+
         last = self.samples[-1]
         frame_delta = max(1, frame_index - last.frame_index)
         return TrackSample(
@@ -169,7 +316,14 @@ class FaceTrack:
         )
 
     def append_sample(self, sample: TrackSample) -> None:
-        if self.samples:
+        if self.prediction_mode == "kalman":
+            if self.samples:
+                self._apply_kalman_prediction(sample.frame_index)
+                if not sample.synthetic:
+                    self._apply_kalman_measurement(sample)
+            else:
+                self._initialize_kalman_filters(sample)
+        elif self.samples:
             previous = self.samples[-1]
             frame_delta = max(1, sample.frame_index - previous.frame_index)
             measured_vx = (sample.cx - previous.cx) / frame_delta
@@ -193,6 +347,16 @@ class MaskFrame:
     size_x: float
     size_y: float
     tilt: float = DEFAULT_TILT
+
+
+@dataclass(frozen=True)
+class ClipProcessingResult:
+    context: SceneContext
+    tracks: list[FaceTrack]
+    frame_width: int
+    frame_height: int
+    providers: list[str]
+    output_text: str
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -228,6 +392,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Resize frames to this width before detection. 0 keeps source resolution.",
+    )
+    parser.add_argument(
+        "--detect-every",
+        default="1",
+        help="Run face detection every N clip frames, or use 'adaptive' to vary cadence by recent motion.",
+    )
+    parser.add_argument(
+        "--prediction-mode",
+        default="velocity",
+        choices=("velocity", "kalman"),
+        help="Track gap-filling predictor. kalman uses a constant-velocity Kalman filter per track. EXPERIMENTAL: on-par or slightly below the default velocity predictor on tested clips; may be removed in a future release.",
     )
     parser.add_argument("--min-score", type=float, default=0.45, help="Drop detections below this confidence score.")
     parser.add_argument("--pad-x", type=float, default=0.25, help="Horizontal mask padding as a fraction of box width.")
@@ -308,6 +483,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.process_width < 0:
         raise ValueError(f"Invalid process-width {args.process_width}; expected 0 or a positive integer")
+    args.detect_every = parse_detect_every_value(args.detect_every)
     if not 0.0 <= args.min_score <= 1.0:
         raise ValueError(f"Invalid min-score {args.min_score}; expected a value between 0 and 1")
     if args.pad_x <= -1.0:
@@ -332,6 +508,59 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.progress_every < 0:
         raise ValueError(f"Invalid progress-every {args.progress_every}; expected 0 or a positive integer")
+    if args.clipboard_in and args.input:
+        raise ValueError("--clipboard-in cannot be combined with file input paths")
+
+
+def parse_detect_every_value(value: Any) -> int | str:
+    normalized = str(value).strip().lower()
+    if normalized == ADAPTIVE_DETECT_EVERY:
+        return ADAPTIVE_DETECT_EVERY
+
+    try:
+        parsed = int(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid detect-every {value!r}; expected a positive integer or '{ADAPTIVE_DETECT_EVERY}'"
+        ) from exc
+
+    if parsed < 1:
+        raise ValueError(f"Invalid detect-every {parsed}; expected at least 1")
+    return parsed
+
+
+def detect_every_max_gap(value: int | str) -> int:
+    if value == ADAPTIVE_DETECT_EVERY:
+        return ADAPTIVE_DETECT_EVERY_MAX - 1
+    return int(value) - 1
+
+
+def detection_motion_ratio(left: FaceBox, right: FaceBox) -> float:
+    delta_position = math.hypot(right.cx - left.cx, right.cy - left.cy)
+    delta_size = math.hypot(right.width - left.width, right.height - left.height)
+    scale = max(left.diagonal, right.diagonal, 1.0)
+    return (delta_position + 0.35 * delta_size) / scale
+
+
+def adaptive_detect_interval(previous_detections: Sequence[FaceBox] | None, current_detections: Sequence[FaceBox]) -> int:
+    if not current_detections:
+        return 1
+    if previous_detections is None:
+        return ADAPTIVE_DETECT_EVERY_DEFAULT
+    if len(previous_detections) != len(current_detections):
+        return 1
+
+    previous_sorted = sorted(previous_detections, key=lambda item: (item.x1, item.y1))
+    current_sorted = sorted(current_detections, key=lambda item: (item.x1, item.y1))
+    max_motion_ratio = max(
+        detection_motion_ratio(previous_item, current_item)
+        for previous_item, current_item in zip(previous_sorted, current_sorted)
+    )
+    if max_motion_ratio >= ADAPTIVE_DETECT_MOTION_RATIO_HIGH:
+        return 1
+    if max_motion_ratio >= ADAPTIVE_DETECT_MOTION_RATIO_LOW:
+        return ADAPTIVE_DETECT_EVERY_DEFAULT
+    return ADAPTIVE_DETECT_EVERY_MAX
 
 
 def configure_logging(level_name: str) -> None:
@@ -842,6 +1071,10 @@ def box_iou(left: FaceBox, right: FaceBox) -> float:
 
 def candidate_cost(track: FaceTrack, detection: FaceBox) -> float | None:
     predicted = track.predict_sample(track.last_frame() + 1).to_box()
+    return candidate_cost_from_prediction(predicted, detection)
+
+
+def candidate_cost_from_prediction(predicted: FaceBox, detection: FaceBox) -> float | None:
     iou = box_iou(predicted, detection)
     center_distance = math.hypot(predicted.cx - detection.cx, predicted.cy - detection.cy)
     scale = max(predicted.diagonal, detection.diagonal, 1.0)
@@ -871,6 +1104,7 @@ def track_detections(
     max_gap: int,
     min_track_length: int,
     smooth_window: int,
+    prediction_mode: str = "velocity",
 ) -> list[FaceTrack]:
     active_tracks: list[FaceTrack] = []
     finished_tracks: list[FaceTrack] = []
@@ -883,26 +1117,36 @@ def track_detections(
         finished_tracks.append(smooth_track(track, smooth_window))
 
     for frame_index, detections in detections_by_frame:
+        predicted_boxes = [track.predict_sample(track.last_frame() + 1).to_box() for track in active_tracks]
+        detection_samples = [mask_box_to_sample(frame_index, detection, pad_x, pad_y) for detection in detections]
         candidates: list[tuple[float, int, int]] = []
-        for track_index, track in enumerate(active_tracks):
+        for track_index, predicted in enumerate(predicted_boxes):
             for detection_index, detection in enumerate(detections):
-                cost = candidate_cost(track, detection)
+                cost = candidate_cost_from_prediction(predicted, detection)
                 if cost is not None:
                     candidates.append((cost, track_index, detection_index))
 
-        matched_tracks: set[int] = set()
-        matched_detections: set[int] = set()
-        for cost, track_index, detection_index in sorted(candidates):
-            if cost > 1.75 or track_index in matched_tracks or detection_index in matched_detections:
+        matched_tracks = [False] * len(active_tracks)
+        matched_detections = [False] * len(detections)
+        matched_track_count = 0
+        matched_detection_count = 0
+        heapq.heapify(candidates)
+        while candidates and matched_track_count < len(active_tracks) and matched_detection_count < len(detections):
+            cost, track_index, detection_index = heapq.heappop(candidates)
+            if cost > 1.75:
+                break
+            if matched_tracks[track_index] or matched_detections[detection_index]:
                 continue
             track = active_tracks[track_index]
-            track.append_sample(mask_box_to_sample(frame_index, detections[detection_index], pad_x, pad_y))
-            matched_tracks.add(track_index)
-            matched_detections.add(detection_index)
+            track.append_sample(detection_samples[detection_index])
+            matched_tracks[track_index] = True
+            matched_detections[detection_index] = True
+            matched_track_count += 1
+            matched_detection_count += 1
 
         remaining_tracks: list[FaceTrack] = []
         for track_index, track in enumerate(active_tracks):
-            if track_index in matched_tracks:
+            if matched_tracks[track_index]:
                 remaining_tracks.append(track)
                 continue
             if track.miss_count < max_gap:
@@ -913,11 +1157,11 @@ def track_detections(
         active_tracks = remaining_tracks
 
         for detection_index, detection in enumerate(detections):
-            if detection_index in matched_detections:
+            if matched_detections[detection_index]:
                 continue
-            track = FaceTrack(track_id=next_track_id)
+            track = FaceTrack(track_id=next_track_id, prediction_mode=prediction_mode)
             next_track_id += 1
-            track.append_sample(mask_box_to_sample(frame_index, detection, pad_x, pad_y))
+            track.append_sample(detection_samples[detection_index])
             active_tracks.append(track)
 
     for track in active_tracks:
@@ -931,18 +1175,28 @@ def smooth_track(track: FaceTrack, radius: int) -> FaceTrack:
     if radius <= 0 or len(track.samples) < 3:
         return track
 
-    def sample_scale(sample: TrackSample) -> float:
-        return math.hypot(sample.half_w * 2.0, sample.half_h * 2.0)
-
-    def adjacent_motion_ratio(left: TrackSample, right: TrackSample) -> float:
-        return math.hypot(left.cx - right.cx, left.cy - right.cy) / max(sample_scale(left), sample_scale(right), 1.0)
+    samples = track.samples
+    sample_count = len(samples)
+    scales = [math.hypot(sample.half_w * 2.0, sample.half_h * 2.0) for sample in samples]
+    adjacent_motion_ratios = [0.0] * (sample_count - 1)
+    for index in range(sample_count - 1):
+        left = samples[index]
+        right = samples[index + 1]
+        adjacent_motion_ratios[index] = math.hypot(left.cx - right.cx, left.cy - right.cy) / max(
+            scales[index],
+            scales[index + 1],
+            1.0,
+        )
 
     def local_motion_ratio(index: int) -> float:
         start = max(1, index - radius)
-        end = min(len(track.samples) - 1, index + radius)
+        end = min(sample_count - 1, index + radius)
         if start > end:
             return 0.0
-        return max(adjacent_motion_ratio(track.samples[step - 1], track.samples[step]) for step in range(start, end + 1))
+        motion_ratio = 0.0
+        for step in range(start, end + 1):
+            motion_ratio = max(motion_ratio, adjacent_motion_ratios[step - 1])
+        return motion_ratio
 
     def position_radius(index: int) -> int:
         motion_ratio = local_motion_ratio(index)
@@ -952,32 +1206,40 @@ def smooth_track(track: FaceTrack, radius: int) -> FaceTrack:
             return min(radius, 1)
         return radius
 
-    def window(index: int, active_radius: int) -> tuple[int, int]:
-        return max(0, index - active_radius), min(len(track.samples), index + active_radius + 1)
-
-    def weights_for(center_index: int, start: int, end: int, active_radius: int) -> list[int]:
-        return [active_radius + 1 - abs(other_index - center_index) for other_index in range(start, end)]
-
     smoothed_samples: list[TrackSample] = []
-    for index, sample in enumerate(track.samples):
+    for index, sample in enumerate(samples):
         pos_radius = position_radius(index)
-        pos_start, pos_end = window(index, pos_radius)
-        pos_weighted = track.samples[pos_start:pos_end]
-        pos_weights = weights_for(index, pos_start, pos_end, pos_radius)
-        pos_total_weight = float(sum(pos_weights))
+        pos_start = max(0, index - pos_radius)
+        pos_end = min(sample_count, index + pos_radius + 1)
+        pos_total_weight = 0.0
+        pos_cx = 0.0
+        pos_cy = 0.0
+        for other_index in range(pos_start, pos_end):
+            weight = pos_radius + 1 - abs(other_index - index)
+            other = samples[other_index]
+            pos_total_weight += weight
+            pos_cx += other.cx * weight
+            pos_cy += other.cy * weight
 
-        size_start, size_end = window(index, radius)
-        size_weighted = track.samples[size_start:size_end]
-        size_weights = weights_for(index, size_start, size_end, radius)
-        size_total_weight = float(sum(size_weights))
+        size_start = max(0, index - radius)
+        size_end = min(sample_count, index + radius + 1)
+        size_total_weight = 0.0
+        size_half_w = 0.0
+        size_half_h = 0.0
+        for other_index in range(size_start, size_end):
+            weight = radius + 1 - abs(other_index - index)
+            other = samples[other_index]
+            size_total_weight += weight
+            size_half_w += other.half_w * weight
+            size_half_h += other.half_h * weight
 
         smoothed_samples.append(
             TrackSample(
                 frame_index=sample.frame_index,
-                cx=sum(item.cx * weight for item, weight in zip(pos_weighted, pos_weights)) / pos_total_weight,
-                cy=sum(item.cy * weight for item, weight in zip(pos_weighted, pos_weights)) / pos_total_weight,
-                half_w=sum(item.half_w * weight for item, weight in zip(size_weighted, size_weights)) / size_total_weight,
-                half_h=sum(item.half_h * weight for item, weight in zip(size_weighted, size_weights)) / size_total_weight,
+                cx=pos_cx / pos_total_weight,
+                cy=pos_cy / pos_total_weight,
+                half_w=size_half_w / size_total_weight,
+                half_h=size_half_h / size_total_weight,
                 angle_deg=sample.angle_deg,
                 synthetic=sample.synthetic,
             )
@@ -1146,17 +1408,18 @@ def detect_faces(detector, cv2, frame_bgr, process_width: int, min_score: float)
     inv_scale = 1.0 / scale
     faces = detector.get(detect_frame)
     detections: list[FaceBox] = []
+    append_detection = detections.append
     for face in faces:
         score = float(getattr(face, "det_score", 1.0))
         if score < min_score:
             continue
-        x1, y1, x2, y2 = [float(value) * inv_scale for value in face.bbox.tolist()]
-        detections.append(
+        bbox = face.bbox
+        append_detection(
             FaceBox(
-                x1=x1,
-                y1=y1,
-                x2=x2,
-                y2=y2,
+                x1=float(bbox[0]) * inv_scale,
+                y1=float(bbox[1]) * inv_scale,
+                x2=float(bbox[2]) * inv_scale,
+                y2=float(bbox[3]) * inv_scale,
                 angle_deg=angle_from_face(face, inv_scale),
                 score=score,
             )
@@ -1190,6 +1453,7 @@ def iter_clip_detections(
     detector,
     cv2,
     process_width: int,
+    detect_every: int | str = 1,
     min_score: float,
     progress_every: int,
 ) -> Iterable[tuple[int, list[FaceBox]]]:
@@ -1211,7 +1475,11 @@ def iter_clip_detections(
         context.frame_height = height if height > 0 else context.frame_height
 
     cached_source_frame: int | None = None
-    cached_frame = None
+    cached_detections: list[FaceBox] | None = None
+    last_detected_clip_frame: int | None = None
+    next_detect_interval = 1
+    last_real_detections: list[FaceBox] | None = None
+    adaptive_detect_every = detect_every == ADAPTIVE_DETECT_EVERY
 
     try:
         for local_frame in range(context.total_frames):
@@ -1222,29 +1490,54 @@ def iter_clip_detections(
                 source_fps,
                 max_source_frame_index,
             )
-
-            frame = None
-            if cached_frame is not None and cached_source_frame == desired_source_frame:
-                frame = cached_frame
-            elif cached_source_frame is not None and desired_source_frame == cached_source_frame + 1:
-                ok, frame = capture.read()
-                if ok:
-                    cached_source_frame = desired_source_frame
-                    cached_frame = frame
+            should_detect = local_frame == 0 or local_frame == context.total_frames - 1
+            if not should_detect:
+                if adaptive_detect_every:
+                    should_detect = (
+                        last_detected_clip_frame is None
+                        or local_frame - last_detected_clip_frame >= next_detect_interval
+                    )
                 else:
-                    frame = None
+                    should_detect = (
+                        int(detect_every) <= 1
+                        or last_detected_clip_frame is None
+                        or local_frame - last_detected_clip_frame >= int(detect_every)
+                    )
 
-            if frame is None:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, desired_source_frame)
+            if cached_source_frame == desired_source_frame and cached_detections is not None:
+                detections = cached_detections
+            else:
+                if cached_source_frame is None:
+                    if desired_source_frame > 0:
+                        capture.set(cv2.CAP_PROP_POS_FRAMES, desired_source_frame)
+                elif desired_source_frame < cached_source_frame:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, desired_source_frame)
+                else:
+                    frames_to_advance = desired_source_frame - cached_source_frame
+                    while frames_to_advance > 1:
+                        if not capture.grab():
+                            raise RuntimeError(
+                                f"Video read failed while advancing to clip frame {clip_frame} "
+                                f"(source frame {desired_source_frame})"
+                            )
+                        frames_to_advance -= 1
+
                 ok, frame = capture.read()
                 if not ok:
                     raise RuntimeError(
                         f"Video read failed at clip frame {clip_frame} (source frame {desired_source_frame})"
                     )
                 cached_source_frame = desired_source_frame
-                cached_frame = frame
+                if should_detect:
+                    detections = detect_faces(detector, cv2, frame, process_width, min_score)
+                    last_detected_clip_frame = local_frame
+                    if adaptive_detect_every:
+                        next_detect_interval = adaptive_detect_interval(last_real_detections, detections)
+                        last_real_detections = detections
+                else:
+                    detections = []
+                cached_detections = detections
 
-            detections = detect_faces(detector, cv2, frame, process_width, min_score)
             if progress_every > 0 and local_frame > 0 and local_frame % progress_every == 0:
                 LOG.info("Processed %s/%s frames", local_frame, context.total_frames)
             yield local_frame, detections
@@ -1261,9 +1554,8 @@ def build_mask_frames(
 ) -> list[MaskFrame]:
     if frame_width <= 0 or frame_height <= 0:
         raise ValueError(f"Invalid source video resolution {frame_width}x{frame_height}; dimensions must be positive")
-
-    sample_by_frame = {sample.frame_index: sample for sample in track.samples}
-    sorted_frame_indices = sorted(sample_by_frame)
+    if not track.samples:
+        return []
 
     def frame_tilt(sample: TrackSample) -> float:
         return (base_tilt + sample.angle_deg / 360.0) % 1.0
@@ -1275,31 +1567,24 @@ def build_mask_frames(
         size_y = 0.0 if zero_size else min(max(sample.half_h / frame_height, 0.0), 1.0)
         return MaskFrame(sample.frame_index if frame_index is None else frame_index, pos_x, pos_y, size_x, size_y, frame_tilt(sample))
 
-    segments: list[list[int]] = [[sorted_frame_indices[0]]]
-    for frame_index in sorted_frame_indices[1:]:
-        if frame_index == segments[-1][-1] + 1:
-            segments[-1].append(frame_index)
-        else:
-            segments.append([frame_index])
+    frames: list[MaskFrame] = []
+    samples = track.samples
+    last_index = len(samples) - 1
+    for sample_index, sample in enumerate(samples):
+        previous_frame_index = samples[sample_index - 1].frame_index if sample_index > 0 else None
+        next_frame_index = samples[sample_index + 1].frame_index if sample_index < last_index else None
 
-    frames: dict[int, MaskFrame] = {}
+        if previous_frame_index is None or sample.frame_index != previous_frame_index + 1:
+            if sample.frame_index > 0:
+                frames.append(normalized(sample, frame_index=sample.frame_index - 1, zero_size=True))
 
-    for segment in segments:
-        segment_start = segment[0]
-        segment_end = segment[-1]
-        first = sample_by_frame[segment_start]
-        last = sample_by_frame[segment_end]
+        frames.append(normalized(sample))
 
-        if segment_start > 0:
-            frames[segment_start - 1] = normalized(first, frame_index=segment_start - 1, zero_size=True)
+        if next_frame_index is None or next_frame_index != sample.frame_index + 1:
+            if sample.frame_index < total_frames - 1:
+                frames.append(normalized(sample, frame_index=sample.frame_index + 1, zero_size=True))
 
-        for frame_index in segment:
-            frames[frame_index] = normalized(sample_by_frame[frame_index])
-
-        if segment_end < total_frames - 1:
-            frames[segment_end + 1] = normalized(last, frame_index=segment_end + 1, zero_size=True)
-
-    return [frames[index] for index in sorted(frames)]
+    return frames
 
 
 def merge_disjoint_tracks(tracks: Sequence[FaceTrack]) -> list[FaceTrack]:
@@ -1472,6 +1757,41 @@ def build_constant_keyframe_string(frames: Sequence[MaskFrame], value: float) ->
     return ";".join(f"{frame.frame_index}={format_float(value)}" for frame in frames)
 
 
+def build_mask_effect_keyframes(frames: Sequence[MaskFrame]) -> dict[str, str]:
+    zero_value = format_float(0.0)
+    one_value = format_float(1.0)
+    min_parts: list[str] = []
+    transition_parts: list[str] = []
+    tilt_parts: list[str] = []
+    size_y_parts: list[str] = []
+    max_parts: list[str] = []
+    size_x_parts: list[str] = []
+    pos_y_parts: list[str] = []
+    pos_x_parts: list[str] = []
+
+    for frame in frames:
+        prefix = f"{frame.frame_index}="
+        min_parts.append(prefix + zero_value)
+        transition_parts.append(prefix + zero_value)
+        tilt_parts.append(prefix + format_float(frame.tilt))
+        size_y_parts.append(prefix + format_float(frame.size_y))
+        max_parts.append(prefix + one_value)
+        size_x_parts.append(prefix + format_float(frame.size_x))
+        pos_y_parts.append(prefix + format_float(frame.pos_y))
+        pos_x_parts.append(prefix + format_float(frame.pos_x))
+
+    return {
+        "filter.Min": ";".join(min_parts),
+        "filter.Transition width": ";".join(transition_parts),
+        "filter.Tilt": ";".join(tilt_parts),
+        "filter.Size Y": ";".join(size_y_parts),
+        "filter.Max": ";".join(max_parts),
+        "filter.Size X": ";".join(size_x_parts),
+        "filter.Position Y": ";".join(pos_y_parts),
+        "filter.Position X": ";".join(pos_x_parts),
+    }
+
+
 def make_property(name: str, value: str) -> ET.Element:
     prop = ET.Element("property", {"name": name})
     prop.text = value
@@ -1501,15 +1821,16 @@ def make_mask_effect(
         min_keyframe_fps=min_keyframe_fps,
         max_keyframe_fps=max_keyframe_fps,
     )
+    keyframes = build_mask_effect_keyframes(frames)
     effect.append(make_property("kdenlive:collapsed", "1"))
-    effect.append(make_property("filter.Min", build_constant_keyframe_string(frames, 0.0)))
-    effect.append(make_property("filter.Transition width", build_constant_keyframe_string(frames, 0.0)))
-    effect.append(make_property("filter.Tilt", build_keyframe_string(frames, lambda item: item.tilt)))
-    effect.append(make_property("filter.Size Y", build_keyframe_string(frames, lambda item: item.size_y)))
-    effect.append(make_property("filter.Max", build_constant_keyframe_string(frames, 1.0)))
-    effect.append(make_property("filter.Size X", build_keyframe_string(frames, lambda item: item.size_x)))
-    effect.append(make_property("filter.Position Y", build_keyframe_string(frames, lambda item: item.pos_y)))
-    effect.append(make_property("filter.Position X", build_keyframe_string(frames, lambda item: item.pos_x)))
+    effect.append(make_property("filter.Min", keyframes["filter.Min"]))
+    effect.append(make_property("filter.Transition width", keyframes["filter.Transition width"]))
+    effect.append(make_property("filter.Tilt", keyframes["filter.Tilt"]))
+    effect.append(make_property("filter.Size Y", keyframes["filter.Size Y"]))
+    effect.append(make_property("filter.Max", keyframes["filter.Max"]))
+    effect.append(make_property("filter.Size X", keyframes["filter.Size X"]))
+    effect.append(make_property("filter.Position Y", keyframes["filter.Position Y"]))
+    effect.append(make_property("filter.Position X", keyframes["filter.Position X"]))
     effect.append(make_property("filter.Shape", format_float(shape)))
     effect.append(make_property("filter.Operation", operation))
     return effect
@@ -1647,19 +1968,31 @@ def write_to_clipboard(text: str) -> None:
     raise RuntimeError("Unable to write clipboard. Install wl-clipboard or xclip/xsel (Linux), or use pbcopy (macOS). On Windows, clip.exe should be available by default.")
 
 
-def generate_tracks(context: SceneContext, args: argparse.Namespace) -> tuple[list[FaceTrack], int, int, list[str]]:
-    if not context.source_path.exists():
-        raise FileNotFoundError(f"Source media not found: {context.source_path}")
-
+def prepare_detector(args: argparse.Namespace):
     det_size = parse_det_size(args.det_size)
     detector, providers, cv2 = build_detector(det_size, args.model_name, args.provider_mode)
     LOG.info("Loaded detector providers=%s det_size=%s model=%s", providers, det_size, args.model_name)
+    return detector, providers, cv2
+
+
+def generate_tracks(
+    context: SceneContext,
+    args: argparse.Namespace,
+    prepared_detector=None,
+) -> tuple[list[FaceTrack], int, int, list[str]]:
+    if not context.source_path.exists():
+        raise FileNotFoundError(f"Source media not found: {context.source_path}")
+
+    if prepared_detector is None:
+        prepared_detector = prepare_detector(args)
+    detector, providers, cv2 = prepared_detector
 
     detections = iter_clip_detections(
         context,
         detector=detector,
         cv2=cv2,
         process_width=args.process_width,
+        detect_every=args.detect_every,
         min_score=args.min_score,
         progress_every=args.progress_every,
     )
@@ -1667,9 +2000,10 @@ def generate_tracks(context: SceneContext, args: argparse.Namespace) -> tuple[li
         detections,
         pad_x=args.pad_x,
         pad_y=args.pad_y,
-        max_gap=args.max_gap,
+        max_gap=max(args.max_gap, detect_every_max_gap(args.detect_every)),
         min_track_length=args.min_track_length,
         smooth_window=args.smooth_window,
+        prediction_mode=args.prediction_mode,
     )
     if context.frame_width is None or context.frame_height is None:
         raise RuntimeError("Unable to determine source video resolution")
@@ -1678,6 +2012,53 @@ def generate_tracks(context: SceneContext, args: argparse.Namespace) -> tuple[li
             f"Invalid source video resolution {context.frame_width}x{context.frame_height}; dimensions must be positive"
         )
     return tracks, context.frame_width, context.frame_height, providers
+
+
+def process_clip_xml(
+    xml_text: str,
+    args: argparse.Namespace,
+    *,
+    xml_path: Path | None = None,
+    prepared_detector=None,
+) -> ClipProcessingResult:
+    context = resolve_scene_context(xml_text, xml_path=xml_path)
+    tracks, frame_width, frame_height, providers = generate_tracks(context, args, prepared_detector=prepared_detector)
+    LOG.info(
+        "Generated %s tracks across %s frames from %s using providers=%s",
+        len(tracks),
+        context.total_frames,
+        context.source_path,
+        providers,
+    )
+    if not tracks:
+        LOG.info(
+            "No face tracks were generated for %s; %s",
+            context.source_path,
+            "replacing existing generated masks with none"
+            if not args.keep_existing_masks
+            else "leaving existing masks unchanged",
+        )
+    output_text = rewrite_scene_with_tracks(
+        xml_text,
+        tracks,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        shape=args.shape,
+        tilt=args.tilt,
+        replace_existing_masks=not args.keep_existing_masks,
+        keyframe_fps=args.keyframe_fps,
+        adaptive_keyframes=args.adaptive_keyframes,
+        min_keyframe_fps=args.min_keyframe_fps,
+        max_keyframe_fps=args.max_keyframe_fps,
+    )
+    return ClipProcessingResult(
+        context=context,
+        tracks=tracks,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        providers=providers,
+        output_text=output_text,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1695,37 +2076,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         xml_text = read_text_input(args)
         xml_path = Path(args.input).expanduser() if args.input and not args.clipboard_in else None
-        context = resolve_scene_context(xml_text, xml_path=xml_path)
-        tracks, frame_width, frame_height, providers = generate_tracks(context, args)
-        LOG.info(
-            "Generated %s tracks across %s frames from %s using providers=%s",
-            len(tracks),
-            context.total_frames,
-            context.source_path,
-            providers,
-        )
-        if not tracks:
-            LOG.info(
-                "No face tracks were generated for %s; %s",
-                context.source_path,
-                "replacing existing generated masks with none"
-                if not args.keep_existing_masks
-                else "leaving existing masks unchanged",
-            )
-        output_text = rewrite_scene_with_tracks(
-            xml_text,
-            tracks,
-            frame_width=frame_width,
-            frame_height=frame_height,
-            shape=args.shape,
-            tilt=args.tilt,
-            replace_existing_masks=not args.keep_existing_masks,
-            keyframe_fps=args.keyframe_fps,
-            adaptive_keyframes=args.adaptive_keyframes,
-            min_keyframe_fps=args.min_keyframe_fps,
-            max_keyframe_fps=args.max_keyframe_fps,
-        )
-        write_text_output(output_text, args)
+        result = process_clip_xml(xml_text, args, xml_path=xml_path)
+        write_text_output(result.output_text, args)
     except (ValueError, RuntimeError, FileNotFoundError) as exc:
         LOG.error("%s", exc)
         return 1

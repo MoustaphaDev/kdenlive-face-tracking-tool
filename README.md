@@ -72,6 +72,14 @@ If clipboard integration is unavailable or you want a simpler debugging path, us
 uv run kdenlive-face-mask /path/to/copied-clip.xml -o /path/to/rewritten-clip.xml
 ```
 
+To profile or compare real clips across different settings, use the included harness:
+
+```bash
+uv run python scripts/profile_kdenlive_face_mask.py sample-clip.xml \
+	--scenario baseline "--model-name buffalo_s --det-size 320x320 --process-width 256" \
+	--scenario adaptive-kalman "--model-name buffalo_s --det-size 320x320 --process-width 256 --detect-every adaptive --prediction-mode kalman"
+```
+
 For install variants, provider tuning, and troubleshooting, see [Setup and Support](docs/setup-and-support.md). For flags, examples, and Kdenlive workflow details, see [Usage Guide](docs/usage.md).
 
 ## What You Get

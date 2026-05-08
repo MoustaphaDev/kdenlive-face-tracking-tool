@@ -1,5 +1,6 @@
 import contextlib
 import io
+import math
 import os
 from pathlib import Path
 import sys
@@ -13,13 +14,19 @@ from unittest.mock import patch
 from xml.sax.saxutils import escape
 
 from kdenlive_face_mask import (
+    ADAPTIVE_DETECT_EVERY,
+    FAST_POSITION_MOTION_RATIO,
     MASK_EFFECT_ID,
+    MODERATE_POSITION_MOTION_RATIO,
+    FaceBox,
     FaceTrack,
     MaskFrame,
+    SceneContext,
     TrackSample,
     build_mask_frames,
     build_detector,
     detect_onnxruntime_support,
+    iter_clip_detections,
     main,
     map_clip_frame_to_source_frame,
     probe_provider_mode,
@@ -27,6 +34,7 @@ from kdenlive_face_mask import (
     resolve_scene_context,
     rewrite_scene_with_tracks,
     smooth_track,
+    track_detections,
     thin_mask_frames,
     write_to_clipboard,
 )
@@ -220,6 +228,320 @@ class SourceFrameMappingTests(unittest.TestCase):
         self.assertEqual(0, map_clip_frame_to_source_frame(0, 60.0, 29.97, 436))
         self.assertEqual(218, map_clip_frame_to_source_frame(437, 60.0, 29.97, 436))
         self.assertEqual(436, map_clip_frame_to_source_frame(875, 60.0, 29.97, 436))
+
+
+class IterClipDetectionsTests(unittest.TestCase):
+    def make_context(self, *, clip_fps: float, total_frames: int) -> SceneContext:
+        return SceneContext(
+            root=ET.Element("kdenlive-scene"),
+            video_clip=ET.Element("clip"),
+            source_path=Path("/tmp/sample.mp4"),
+            fps=clip_fps,
+            in_frame=0,
+            out_frame=total_frames - 1,
+            total_frames=total_frames,
+            frame_width=640,
+            frame_height=360,
+        )
+
+    def make_cv2(self, capture):
+        class FakeCv2:
+            CAP_PROP_FPS = 1
+            CAP_PROP_FRAME_COUNT = 2
+            CAP_PROP_FRAME_WIDTH = 3
+            CAP_PROP_FRAME_HEIGHT = 4
+            CAP_PROP_POS_FRAMES = 5
+
+            def VideoCapture(self, _path):
+                return capture
+
+        return FakeCv2()
+
+    def test_reuses_detections_for_duplicate_source_frames(self) -> None:
+        class FakeCapture:
+            def __init__(self):
+                self.next_frame = 0
+                self.read_calls = 0
+                self.grab_calls = 0
+                self.set_calls: list[int] = []
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                if prop == 1:
+                    return 30.0
+                if prop == 2:
+                    return 120.0
+                return 0.0
+
+            def read(self):
+                frame = self.next_frame
+                self.next_frame += 1
+                self.read_calls += 1
+                return True, frame
+
+            def grab(self):
+                self.next_frame += 1
+                self.grab_calls += 1
+                return True
+
+            def set(self, _prop, value):
+                self.set_calls.append(int(value))
+                self.next_frame = int(value)
+                return True
+
+            def release(self):
+                return None
+
+        capture = FakeCapture()
+        seen_frames: list[int] = []
+
+        def fake_detect_faces(_detector, _cv2, frame, process_width: int, min_score: float):
+            self.assertEqual(0, process_width)
+            self.assertEqual(0.0, min_score)
+            seen_frames.append(frame)
+            return [FaceBox(float(frame), 0.0, float(frame) + 1.0, 1.0)]
+
+        with patch("kdenlive_face_mask.detect_faces", side_effect=fake_detect_faces):
+            detections = list(
+                iter_clip_detections(
+                    self.make_context(clip_fps=60.0, total_frames=5),
+                    detector=object(),
+                    cv2=self.make_cv2(capture),
+                    process_width=0,
+                    min_score=0.0,
+                    progress_every=0,
+                )
+            )
+
+        self.assertEqual([0, 1, 2], seen_frames)
+        self.assertEqual([0, 0, 1, 1, 2], [int(frame_detections[0].x1) for _, frame_detections in detections])
+        self.assertEqual(3, capture.read_calls)
+        self.assertEqual(0, capture.grab_calls)
+        self.assertEqual([], capture.set_calls)
+
+    def test_uses_grab_to_advance_monotonically_without_extra_seeks(self) -> None:
+        class FakeCapture:
+            def __init__(self):
+                self.next_frame = 0
+                self.read_calls = 0
+                self.grab_calls = 0
+                self.set_calls: list[int] = []
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                if prop == 1:
+                    return 60.0
+                if prop == 2:
+                    return 120.0
+                return 0.0
+
+            def read(self):
+                frame = self.next_frame
+                self.next_frame += 1
+                self.read_calls += 1
+                return True, frame
+
+            def grab(self):
+                self.next_frame += 1
+                self.grab_calls += 1
+                return True
+
+            def set(self, _prop, value):
+                self.set_calls.append(int(value))
+                self.next_frame = int(value)
+                return True
+
+            def release(self):
+                return None
+
+        capture = FakeCapture()
+        seen_frames: list[int] = []
+
+        def fake_detect_faces(_detector, _cv2, frame, _process_width: int, _min_score: float):
+            seen_frames.append(frame)
+            return []
+
+        with patch("kdenlive_face_mask.detect_faces", side_effect=fake_detect_faces):
+            list(
+                iter_clip_detections(
+                    self.make_context(clip_fps=30.0, total_frames=4),
+                    detector=object(),
+                    cv2=self.make_cv2(capture),
+                    process_width=0,
+                    min_score=0.0,
+                    progress_every=0,
+                )
+            )
+
+        self.assertEqual([0, 2, 4, 6], seen_frames)
+        self.assertEqual(4, capture.read_calls)
+        self.assertEqual(3, capture.grab_calls)
+        self.assertEqual([], capture.set_calls)
+
+    def test_detect_every_skips_intermediate_clip_frames(self) -> None:
+        class FakeCapture:
+            def __init__(self):
+                self.next_frame = 0
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                if prop == 1:
+                    return 30.0
+                if prop == 2:
+                    return 120.0
+                return 0.0
+
+            def read(self):
+                frame = self.next_frame
+                self.next_frame += 1
+                return True, frame
+
+            def grab(self):
+                self.next_frame += 1
+                return True
+
+            def set(self, _prop, value):
+                self.next_frame = int(value)
+                return True
+
+            def release(self):
+                return None
+
+        capture = FakeCapture()
+        seen_frames: list[int] = []
+
+        def fake_detect_faces(_detector, _cv2, frame, _process_width: int, _min_score: float):
+            seen_frames.append(frame)
+            return [FaceBox(float(frame), 0.0, float(frame) + 1.0, 1.0)]
+
+        with patch("kdenlive_face_mask.detect_faces", side_effect=fake_detect_faces):
+            detections = list(
+                iter_clip_detections(
+                    self.make_context(clip_fps=30.0, total_frames=5),
+                    detector=object(),
+                    cv2=self.make_cv2(capture),
+                    process_width=0,
+                    detect_every=2,
+                    min_score=0.0,
+                    progress_every=0,
+                )
+            )
+
+        self.assertEqual([0, 2, 4], seen_frames)
+        self.assertEqual([1, 0, 1, 0, 1], [len(frame_detections) for _, frame_detections in detections])
+
+    def test_detect_every_adaptive_widens_gaps_for_stable_motion(self) -> None:
+        class FakeCapture:
+            def __init__(self):
+                self.next_frame = 0
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                if prop == 1:
+                    return 30.0
+                if prop == 2:
+                    return 120.0
+                return 0.0
+
+            def read(self):
+                frame = self.next_frame
+                self.next_frame += 1
+                return True, frame
+
+            def grab(self):
+                self.next_frame += 1
+                return True
+
+            def set(self, _prop, value):
+                self.next_frame = int(value)
+                return True
+
+            def release(self):
+                return None
+
+        capture = FakeCapture()
+        seen_frames: list[int] = []
+
+        def fake_detect_faces(_detector, _cv2, frame, _process_width: int, _min_score: float):
+            seen_frames.append(frame)
+            return [FaceBox(10.0, 10.0, 40.0, 40.0)]
+
+        with patch("kdenlive_face_mask.detect_faces", side_effect=fake_detect_faces):
+            list(
+                iter_clip_detections(
+                    self.make_context(clip_fps=30.0, total_frames=8),
+                    detector=object(),
+                    cv2=self.make_cv2(capture),
+                    process_width=0,
+                    detect_every=ADAPTIVE_DETECT_EVERY,
+                    min_score=0.0,
+                    progress_every=0,
+                )
+            )
+
+        self.assertEqual([0, 2, 5, 7], seen_frames)
+
+    def test_detect_every_adaptive_collapses_to_dense_after_fast_motion(self) -> None:
+        class FakeCapture:
+            def __init__(self):
+                self.next_frame = 0
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                if prop == 1:
+                    return 30.0
+                if prop == 2:
+                    return 120.0
+                return 0.0
+
+            def read(self):
+                frame = self.next_frame
+                self.next_frame += 1
+                return True, frame
+
+            def grab(self):
+                self.next_frame += 1
+                return True
+
+            def set(self, _prop, value):
+                self.next_frame = int(value)
+                return True
+
+            def release(self):
+                return None
+
+        capture = FakeCapture()
+        seen_frames: list[int] = []
+
+        def fake_detect_faces(_detector, _cv2, frame, _process_width: int, _min_score: float):
+            seen_frames.append(frame)
+            base = float(frame * 50)
+            return [FaceBox(base, 10.0, base + 30.0, 40.0)]
+
+        with patch("kdenlive_face_mask.detect_faces", side_effect=fake_detect_faces):
+            list(
+                iter_clip_detections(
+                    self.make_context(clip_fps=30.0, total_frames=6),
+                    detector=object(),
+                    cv2=self.make_cv2(capture),
+                    process_width=0,
+                    detect_every=ADAPTIVE_DETECT_EVERY,
+                    min_score=0.0,
+                    progress_every=0,
+                )
+            )
+
+        self.assertEqual([0, 2, 3, 4, 5], seen_frames)
 
 
 class RuntimeDependencySmokeTests(unittest.TestCase):
@@ -979,8 +1301,134 @@ class ValidationTests(unittest.TestCase):
 
         self.assertEqual(1, exit_code)
 
+    def test_main_rejects_detect_every_below_one(self) -> None:
+        exit_code = main(["--detect-every", "0", "--log-level", "ERROR"])
+
+        self.assertEqual(1, exit_code)
+
+    def test_main_rejects_invalid_detect_every_keyword(self) -> None:
+        exit_code = main(["--detect-every", "banana", "--log-level", "ERROR"])
+
+        self.assertEqual(1, exit_code)
+
+
+class TrackDetectionsTests(unittest.TestCase):
+    @staticmethod
+    def make_box(x1: float, y1: float, x2: float, y2: float) -> FaceBox:
+        return FaceBox(x1=x1, y1=y1, x2=x2, y2=y2, score=0.99)
+
+    def test_matches_lowest_cost_pairs_and_bridges_short_gaps(self) -> None:
+        detections_by_frame = [
+            (0, [self.make_box(0.0, 0.0, 10.0, 10.0), self.make_box(100.0, 0.0, 110.0, 10.0)]),
+            (1, [self.make_box(102.0, 0.0, 112.0, 10.0), self.make_box(2.0, 0.0, 12.0, 10.0)]),
+            (2, [self.make_box(4.0, 0.0, 14.0, 10.0)]),
+            (3, [self.make_box(106.0, 0.0, 116.0, 10.0), self.make_box(6.0, 0.0, 16.0, 10.0)]),
+        ]
+
+        for prediction_mode in ("velocity", "kalman"):
+            tracks = track_detections(
+                detections_by_frame,
+                pad_x=0.0,
+                pad_y=0.0,
+                max_gap=2,
+                min_track_length=1,
+                smooth_window=0,
+                prediction_mode=prediction_mode,
+            )
+
+            self.assertEqual(2, len(tracks))
+
+            left_track, right_track = tracks
+            self.assertTrue(all(sample.cx < 50.0 for sample in left_track.samples))
+            self.assertTrue(all(sample.cx > 50.0 for sample in right_track.samples))
+            self.assertEqual([0, 1, 2, 3], [sample.frame_index for sample in left_track.samples])
+            self.assertEqual([0, 1, 2, 3], [sample.frame_index for sample in right_track.samples])
+            self.assertEqual([False, False, False, False], [sample.synthetic for sample in left_track.samples])
+            self.assertEqual([False, False, True, False], [sample.synthetic for sample in right_track.samples])
+
 
 class SmoothTrackTests(unittest.TestCase):
+    @staticmethod
+    def clone_track(track: FaceTrack) -> FaceTrack:
+        return FaceTrack(
+            track_id=track.track_id,
+            samples=[
+                TrackSample(
+                    frame_index=sample.frame_index,
+                    cx=sample.cx,
+                    cy=sample.cy,
+                    half_w=sample.half_w,
+                    half_h=sample.half_h,
+                    angle_deg=sample.angle_deg,
+                    synthetic=sample.synthetic,
+                )
+                for sample in track.samples
+            ],
+            vx=track.vx,
+            vy=track.vy,
+            miss_count=track.miss_count,
+        )
+
+    @staticmethod
+    def smooth_track_naive(track: FaceTrack, radius: int) -> FaceTrack:
+        if radius <= 0 or len(track.samples) < 3:
+            return track
+
+        def sample_scale(sample: TrackSample) -> float:
+            return math.hypot(sample.half_w * 2.0, sample.half_h * 2.0)
+
+        def adjacent_motion_ratio(left: TrackSample, right: TrackSample) -> float:
+            return math.hypot(left.cx - right.cx, left.cy - right.cy) / max(sample_scale(left), sample_scale(right), 1.0)
+
+        def local_motion_ratio(index: int) -> float:
+            start = max(1, index - radius)
+            end = min(len(track.samples) - 1, index + radius)
+            if start > end:
+                return 0.0
+            return max(adjacent_motion_ratio(track.samples[step - 1], track.samples[step]) for step in range(start, end + 1))
+
+        def position_radius(index: int) -> int:
+            motion_ratio = local_motion_ratio(index)
+            if motion_ratio >= FAST_POSITION_MOTION_RATIO:
+                return 0
+            if motion_ratio >= MODERATE_POSITION_MOTION_RATIO:
+                return min(radius, 1)
+            return radius
+
+        def window(index: int, active_radius: int) -> tuple[int, int]:
+            return max(0, index - active_radius), min(len(track.samples), index + active_radius + 1)
+
+        def weights_for(center_index: int, start: int, end: int, active_radius: int) -> list[int]:
+            return [active_radius + 1 - abs(other_index - center_index) for other_index in range(start, end)]
+
+        smoothed_samples: list[TrackSample] = []
+        for index, sample in enumerate(track.samples):
+            pos_radius = position_radius(index)
+            pos_start, pos_end = window(index, pos_radius)
+            pos_weighted = track.samples[pos_start:pos_end]
+            pos_weights = weights_for(index, pos_start, pos_end, pos_radius)
+            pos_total_weight = float(sum(pos_weights))
+
+            size_start, size_end = window(index, radius)
+            size_weighted = track.samples[size_start:size_end]
+            size_weights = weights_for(index, size_start, size_end, radius)
+            size_total_weight = float(sum(size_weights))
+
+            smoothed_samples.append(
+                TrackSample(
+                    frame_index=sample.frame_index,
+                    cx=sum(item.cx * weight for item, weight in zip(pos_weighted, pos_weights)) / pos_total_weight,
+                    cy=sum(item.cy * weight for item, weight in zip(pos_weighted, pos_weights)) / pos_total_weight,
+                    half_w=sum(item.half_w * weight for item, weight in zip(size_weighted, size_weights)) / size_total_weight,
+                    half_h=sum(item.half_h * weight for item, weight in zip(size_weighted, size_weights)) / size_total_weight,
+                    angle_deg=sample.angle_deg,
+                    synthetic=sample.synthetic,
+                )
+            )
+
+        track.samples = smoothed_samples
+        return track
+
     def test_preserves_sharp_position_changes(self) -> None:
         track = FaceTrack(
             track_id=1,
@@ -998,6 +1446,35 @@ class SmoothTrackTests(unittest.TestCase):
         self.assertEqual(100.0, track.samples[1].cx)
         self.assertEqual(180.0, track.samples[2].cx)
         self.assertEqual(180.0, track.samples[3].cx)
+
+    def test_matches_previous_weighted_smoothing_behavior(self) -> None:
+        original = FaceTrack(
+            track_id=9,
+            samples=[
+                TrackSample(frame_index=0, cx=100.0, cy=120.0, half_w=20.0, half_h=28.0),
+                TrackSample(frame_index=1, cx=104.0, cy=121.0, half_w=21.0, half_h=29.0),
+                TrackSample(frame_index=2, cx=109.0, cy=123.0, half_w=19.0, half_h=27.0),
+                TrackSample(frame_index=3, cx=160.0, cy=124.0, half_w=18.0, half_h=26.0),
+                TrackSample(frame_index=4, cx=164.0, cy=126.0, half_w=17.0, half_h=25.0),
+                TrackSample(frame_index=5, cx=168.0, cy=129.0, half_w=18.0, half_h=24.0),
+                TrackSample(frame_index=6, cx=171.0, cy=131.0, half_w=19.0, half_h=23.0),
+            ],
+        )
+
+        optimized = self.clone_track(original)
+        expected = self.clone_track(original)
+
+        smooth_track(optimized, radius=2)
+        self.smooth_track_naive(expected, radius=2)
+
+        for optimized_sample, expected_sample in zip(optimized.samples, expected.samples):
+            self.assertEqual(expected_sample.frame_index, optimized_sample.frame_index)
+            self.assertAlmostEqual(expected_sample.cx, optimized_sample.cx)
+            self.assertAlmostEqual(expected_sample.cy, optimized_sample.cy)
+            self.assertAlmostEqual(expected_sample.half_w, optimized_sample.half_w)
+            self.assertAlmostEqual(expected_sample.half_h, optimized_sample.half_h)
+            self.assertEqual(expected_sample.angle_deg, optimized_sample.angle_deg)
+            self.assertEqual(expected_sample.synthetic, optimized_sample.synthetic)
 
 
 class DoctorModeTests(unittest.TestCase):
@@ -1194,7 +1671,6 @@ class EndToEndCliSmokeTests(unittest.TestCase):
         self.assertEqual(1, len(effects))
         self.assertEqual(MASK_EFFECT_ID, effects[0].attrib.get("id"))
         self.assertIsNotNone(effects[0].find("./property[@name='filter.Position X']"))
-
 
 if __name__ == "__main__":
     unittest.main()

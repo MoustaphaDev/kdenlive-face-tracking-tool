@@ -16,7 +16,7 @@ Position smoothing is motion-adaptive: slow movement is smoothed to reduce jitte
 
 Mask tilt follows the detected eye-line angle for each tracked face. `--tilt` remains the neutral baseline, so you can bias the generated mask orientation while still keeping per-frame face rotation.
 
-Detection and tracking run at full clip FPS. Keyframe-density controls only reduce serialized Kdenlive keyframes written into XML after tracking is complete.
+By default detection and tracking run at full clip FPS. `--detect-every N` lets you run detection at a fixed lower clip-frame cadence and synthesize intermediate track samples. `--detect-every adaptive` starts sparse, then tightens back toward full-rate detection whenever recent real detections show faster motion or changing face counts. Keyframe-density controls still only reduce serialized Kdenlive keyframes written into XML after tracking is complete.
 
 ## Basic Usage
 
@@ -42,8 +42,8 @@ wl-paste --no-newline | uv run kdenlive-face-mask > rewritten-clip.xml
 
 ## Useful Flags
 
-- `input` (positional) reads copied-clip XML from a file path; omit it to read from stdin.
-- `-o, --output FILE` writes rewritten XML to a file; omit it to write to stdout.
+- `input` (positional) reads one copied-clip XML file path; omit it to read from stdin.
+- `-o, --output FILE` writes one rewritten XML document to a file; omit it to write a single-input run to stdout.
 - `--clipboard-in` and `--clipboard-out` read/write XML through the system clipboard. Requires `wl-clipboard` or `xclip`/`xsel` on Linux, uses built-in `pbpaste`/`pbcopy` on macOS, and prefers a UTF-8 PowerShell path on Windows with `clip.exe` as fallback.
 - `--det-size WIDTHxHEIGHT` sets detector input size, for example `320x320` for speed or `640x640` for smaller faces.
 - `--model-name MODEL` chooses InsightFace model, for example `buffalo_s` for speed or `buffalo_l` for offline quality.
@@ -53,6 +53,9 @@ wl-paste --no-newline | uv run kdenlive-face-mask > rewritten-clip.xml
 - Use `openvino` on Intel hardware with the `openvino` extra installed.
 - Use `migraphx` only if you explicitly want MIGraphX.
 - `--process-width 0` keeps full source resolution during detection.
+- `--detect-every N` runs the detector every `N` clip frames and fills in intermediate frames with synthetic track samples.
+- `--detect-every adaptive` picks a cadence of 1, 2, or 3 frames based on recent real detection motion and face-count stability.
+- `--prediction-mode velocity|kalman` chooses the gap-filling model used between real detections. The `kalman` option is **experimental** — benchmarks show it on-par with or slightly below `velocity` on typical clips; it may be removed in a future release.
 - `--keyframe-fps` limits emitted Kdenlive keyframes while preserving full-rate tracking internally.
 - `--adaptive-keyframes` varies emitted keyframe density by motion speed.
 - `--keep-existing-masks` appends generated masks instead of replacing existing `mask_start` effects.
@@ -82,6 +85,24 @@ Faster clipboard run:
 
 ```bash
 uv run kdenlive-face-mask --clipboard-in --clipboard-out --det-size 320x320 --process-width 256 --model-name buffalo_s
+```
+
+Sparse-detection fast clipboard run:
+
+```bash
+uv run kdenlive-face-mask --clipboard-in --clipboard-out --det-size 320x320 --process-width 256 --model-name buffalo_s --detect-every 2
+```
+
+Adaptive sparse-detection clipboard run:
+
+```bash
+uv run kdenlive-face-mask --clipboard-in --clipboard-out --det-size 320x320 --process-width 256 --model-name buffalo_s --detect-every adaptive
+```
+
+Adaptive sparse detection with Kalman-based gap filling (**experimental** — may be yanked):
+
+```bash
+uv run kdenlive-face-mask --clipboard-in --clipboard-out --det-size 320x320 --process-width 256 --model-name buffalo_s --detect-every adaptive --prediction-mode kalman
 ```
 
 Fixed output keyframe rate:
@@ -144,6 +165,18 @@ What this command does:
 - Runs the installed CLI with the CUDA extra enabled.
 - Requests NVIDIA CUDA first and falls back to CPU if CUDA initialization fails.
 - Keeps the rest of the fast local workflow similar to the CPU example.
+
+## Profiling And Comparisons
+
+Use the profiling harness to benchmark a real copied-clip XML file and compare multiple CLI scenarios against the same baseline:
+
+```bash
+uv run python scripts/profile_kdenlive_face_mask.py sample-clip.xml \
+  --scenario baseline "--model-name buffalo_s --det-size 320x320 --process-width 256" \
+  --scenario adaptive-kalman "--model-name buffalo_s --det-size 320x320 --process-width 256 --detect-every adaptive --prediction-mode kalman"
+```
+
+The first scenario is treated as the baseline. Later scenarios report speedup and frame-level box similarity against that baseline, using generated tracks as the reference rather than external ground truth.
 
 ## Using Generated Masks in Kdenlive
 

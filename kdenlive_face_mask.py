@@ -1551,6 +1551,7 @@ def build_mask_frames(
     frame_width: int,
     frame_height: int,
     base_tilt: float = DEFAULT_TILT,
+    frame_index_offset: int = 0,
 ) -> list[MaskFrame]:
     if frame_width <= 0 or frame_height <= 0:
         raise ValueError(f"Invalid source video resolution {frame_width}x{frame_height}; dimensions must be positive")
@@ -1560,31 +1561,15 @@ def build_mask_frames(
     def frame_tilt(sample: TrackSample) -> float:
         return (base_tilt + sample.angle_deg / 360.0) % 1.0
 
-    def normalized(sample: TrackSample, frame_index: int | None = None, zero_size: bool = False) -> MaskFrame:
+    def normalized(sample: TrackSample, frame_index: int | None = None) -> MaskFrame:
         pos_x = min(max(sample.cx / frame_width, 0.0), 1.0)
         pos_y = min(max(sample.cy / frame_height, 0.0), 1.0)
-        size_x = 0.0 if zero_size else min(max(sample.half_w / frame_width, 0.0), 1.0)
-        size_y = 0.0 if zero_size else min(max(sample.half_h / frame_height, 0.0), 1.0)
-        return MaskFrame(sample.frame_index if frame_index is None else frame_index, pos_x, pos_y, size_x, size_y, frame_tilt(sample))
+        size_x = min(max(sample.half_w / frame_width, 0.0), 1.0)
+        size_y = min(max(sample.half_h / frame_height, 0.0), 1.0)
+        absolute_frame_index = (sample.frame_index if frame_index is None else frame_index) + frame_index_offset
+        return MaskFrame(absolute_frame_index, pos_x, pos_y, size_x, size_y, frame_tilt(sample))
 
-    frames: list[MaskFrame] = []
-    samples = track.samples
-    last_index = len(samples) - 1
-    for sample_index, sample in enumerate(samples):
-        previous_frame_index = samples[sample_index - 1].frame_index if sample_index > 0 else None
-        next_frame_index = samples[sample_index + 1].frame_index if sample_index < last_index else None
-
-        if previous_frame_index is None or sample.frame_index != previous_frame_index + 1:
-            if sample.frame_index > 0:
-                frames.append(normalized(sample, frame_index=sample.frame_index - 1, zero_size=True))
-
-        frames.append(normalized(sample))
-
-        if next_frame_index is None or next_frame_index != sample.frame_index + 1:
-            if sample.frame_index < total_frames - 1:
-                frames.append(normalized(sample, frame_index=sample.frame_index + 1, zero_size=True))
-
-    return frames
+    return [normalized(sample) for sample in track.samples]
 
 
 def merge_disjoint_tracks(tracks: Sequence[FaceTrack]) -> list[FaceTrack]:
@@ -1811,10 +1796,18 @@ def make_mask_effect(
     adaptive_keyframes: bool,
     min_keyframe_fps: float,
     max_keyframe_fps: float,
+    frame_index_offset: int = 0,
 ) -> ET.Element:
     effect = ET.Element("effect", {"id": MASK_EFFECT_ID})
     frames = thin_mask_frames(
-        build_mask_frames(track, total_frames, frame_width, frame_height, tilt),
+        build_mask_frames(
+            track,
+            total_frames,
+            frame_width,
+            frame_height,
+            tilt,
+            frame_index_offset=frame_index_offset,
+        ),
         clip_fps=clip_fps,
         keyframe_fps=keyframe_fps,
         adaptive_keyframes=adaptive_keyframes,
@@ -1885,6 +1878,7 @@ def rewrite_scene_with_tracks(
                 adaptive_keyframes,
                 min_keyframe_fps,
                 max_keyframe_fps,
+                frame_index_offset=context.in_frame,
             )
         )
 

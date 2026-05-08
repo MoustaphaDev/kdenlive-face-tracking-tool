@@ -132,6 +132,35 @@ NO_EFFECT_SCENE_XML = """<kdenlive-scene audioTracks="2" documentid="17775642211
 </kdenlive-scene>
 """
 
+TRIMMED_SCENE_XML = """<kdenlive-scene audioTracks="3" documentid="1777564221124" duration="3" fps="60" mainClip="36;35" masterAudioTrack="1" masterTrack="4" offset="0" videoTracks="3">
+ <clip audioStream="1" binid="6" id="36" in="45077" out="45079" playlist="0" position="0" speed="1.000000" state="1" track="4">
+  <effects parentIn="45077"/>
+ </clip>
+ <clip audioStream="1" audioTrack="1" binid="6" id="35" in="45077" mirrorTrack="4" out="45079" playlist="0" position="0" speed="1.000000" state="2" track="1">
+  <effects parentIn="45077"/>
+ </clip>
+ <bin>
+  <chain id="chain5" out="71093" type="3">
+   <property name="length">71094</property>
+   <property name="eof">pause</property>
+   <property name="resource">/tmp/sample.mp4</property>
+   <property name="mlt_service">avformat-novalidate</property>
+   <property name="seekable">1</property>
+   <property name="format">3</property>
+   <property name="audio_index">1</property>
+   <property name="video_index">0</property>
+   <property name="vstream">0</property>
+   <property name="astream">0</property>
+   <property name="kdenlive:folderid">-1</property>
+   <property name="kdenlive:id">6</property>
+   <property name="meta.media.width">1920</property>
+   <property name="meta.media.height">1080</property>
+  </chain>
+ </bin>
+ <groups>[]</groups>
+</kdenlive-scene>
+"""
+
 
 def make_track(track_id: int, frames: range, base_x: float) -> FaceTrack:
     return FaceTrack(
@@ -231,14 +260,14 @@ class SourceFrameMappingTests(unittest.TestCase):
 
 
 class IterClipDetectionsTests(unittest.TestCase):
-    def make_context(self, *, clip_fps: float, total_frames: int) -> SceneContext:
+    def make_context(self, *, clip_fps: float, total_frames: int, in_frame: int = 0) -> SceneContext:
         return SceneContext(
             root=ET.Element("kdenlive-scene"),
             video_clip=ET.Element("clip"),
             source_path=Path("/tmp/sample.mp4"),
             fps=clip_fps,
-            in_frame=0,
-            out_frame=total_frames - 1,
+            in_frame=in_frame,
+            out_frame=in_frame + total_frames - 1,
             total_frames=total_frames,
             frame_width=640,
             frame_height=360,
@@ -435,6 +464,61 @@ class IterClipDetectionsTests(unittest.TestCase):
 
         self.assertEqual([0, 2, 4], seen_frames)
         self.assertEqual([1, 0, 1, 0, 1], [len(frame_detections) for _, frame_detections in detections])
+
+    def test_non_zero_clip_in_seeks_directly_to_trimmed_source_range(self) -> None:
+        class FakeCapture:
+            def __init__(self):
+                self.next_frame = 0
+                self.set_calls: list[int] = []
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                if prop == 1:
+                    return 60.0
+                if prop == 2:
+                    return 80000.0
+                return 0.0
+
+            def read(self):
+                frame = self.next_frame
+                self.next_frame += 1
+                return True, frame
+
+            def grab(self):
+                self.next_frame += 1
+                return True
+
+            def set(self, _prop, value):
+                self.set_calls.append(int(value))
+                self.next_frame = int(value)
+                return True
+
+            def release(self):
+                return None
+
+        capture = FakeCapture()
+        seen_frames: list[int] = []
+
+        def fake_detect_faces(_detector, _cv2, frame, _process_width: int, _min_score: float):
+            seen_frames.append(frame)
+            return []
+
+        with patch("kdenlive_face_mask.detect_faces", side_effect=fake_detect_faces):
+            list(
+                iter_clip_detections(
+                    self.make_context(clip_fps=60.0, total_frames=3, in_frame=45077),
+                    detector=object(),
+                    cv2=self.make_cv2(capture),
+                    process_width=0,
+                    min_score=0.0,
+                    progress_every=0,
+                )
+            )
+
+        self.assertEqual([45077, 45078, 45079], seen_frames)
+        self.assertEqual([45077], capture.set_calls)
 
     def test_detect_every_adaptive_widens_gaps_for_stable_motion(self) -> None:
         class FakeCapture:
@@ -1029,7 +1113,7 @@ class ClipboardTests(unittest.TestCase):
         effects = root.findall("./clip[@id='15']/effects/effect")
         self.assertEqual(2, len(effects))
 
-    def test_zero_sizes_are_inserted_outside_track_span(self) -> None:
+    def test_mask_keyframes_only_cover_track_frames(self) -> None:
         rewritten = rewrite_scene_with_tracks(
             SCENE_XML,
             [make_track(7, range(10, 13), 520.0)],
@@ -1045,9 +1129,9 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
-        self.assertEqual("9=0;10=0.0197917;11=0.0197917;12=0.0197917;13=0", size_x.text)
+        self.assertEqual("10=0.0197917;11=0.0197917;12=0.0197917", size_x.text)
 
-    def test_mask_keyframes_stay_local_to_track_span(self) -> None:
+    def test_mask_keyframes_skip_gap_anchors_between_disjoint_segments(self) -> None:
         rewritten = rewrite_scene_with_tracks(
             SCENE_XML,
             [make_track(1, range(0, 6), 300.0), make_track(2, range(8, 12), 700.0)],
@@ -1065,11 +1149,11 @@ class ClipboardTests(unittest.TestCase):
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
         self.assertEqual(
-            "0=0.0197917;1=0.0197917;2=0.0197917;3=0.0197917;4=0.0197917;5=0.0197917;6=0;7=0;8=0.0197917;9=0.0197917;10=0.0197917;11=0.0197917;12=0",
+            "0=0.0197917;1=0.0197917;2=0.0197917;3=0.0197917;4=0.0197917;5=0.0197917;8=0.0197917;9=0.0197917;10=0.0197917;11=0.0197917",
             size_x.text,
         )
 
-    def test_non_zero_start_track_uses_pre_segment_zero_anchor_only(self) -> None:
+    def test_non_zero_start_track_does_not_emit_zero_size_anchors(self) -> None:
         rewritten = rewrite_scene_with_tracks(
             SCENE_XML,
             [make_track(11, range(8, 12), 700.0)],
@@ -1085,7 +1169,7 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
-        self.assertEqual("7=0;8=0.0197917;9=0.0197917;10=0.0197917;11=0.0197917;12=0", size_x.text)
+        self.assertEqual("8=0.0197917;9=0.0197917;10=0.0197917;11=0.0197917", size_x.text)
 
     def test_start_of_clip_track_begins_visible_on_frame_zero(self) -> None:
         rewritten = rewrite_scene_with_tracks(
@@ -1103,7 +1187,7 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
-        self.assertEqual("0=0.0197917;1=0.0197917;2=0.0197917;3=0", size_x.text)
+        self.assertEqual("0=0.0197917;1=0.0197917;2=0.0197917", size_x.text)
 
     def test_single_frame_track_at_clip_start_remains_visible(self) -> None:
         rewritten = rewrite_scene_with_tracks(
@@ -1121,7 +1205,25 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
-        self.assertEqual("0=0.0197917;1=0", size_x.text)
+        self.assertEqual("0=0.0197917", size_x.text)
+
+    def test_non_zero_clip_in_offsets_serialized_keyframes(self) -> None:
+        rewritten = rewrite_scene_with_tracks(
+            TRIMMED_SCENE_XML,
+            [make_track(12, range(0, 3), 420.0)],
+            frame_width=1920,
+            frame_height=1080,
+            shape=0.38,
+            tilt=0.5,
+            replace_existing_masks=True,
+        )
+
+        root = ET.fromstring(rewritten)
+        effect = root.find("./clip[@id='36']/effects/effect")
+        self.assertIsNotNone(effect)
+        size_x = effect.find("./property[@name='filter.Size X']")
+        self.assertIsNotNone(size_x)
+        self.assertEqual("45077=0.0197917;45078=0.0197917;45079=0.0197917", size_x.text)
 
     def test_adds_mask_to_empty_video_clip_effects(self) -> None:
         rewritten = rewrite_scene_with_tracks(
@@ -1160,7 +1262,7 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         size_x = effect.find("./property[@name='filter.Size X']")
         self.assertIsNotNone(size_x)
-        self.assertEqual("0=0.0197917;4=0.0197917;7=0.0197917;8=0", size_x.text)
+        self.assertEqual("0=0.0197917;4=0.0197917;7=0.0197917", size_x.text)
 
     def test_face_angle_emits_tilt_keyframes(self) -> None:
         track = FaceTrack(
@@ -1187,7 +1289,7 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         tilt = effect.find("./property[@name='filter.Tilt']")
         self.assertIsNotNone(tilt)
-        self.assertEqual("0=0.5;1=0.75;2=0.25;3=0.25", tilt.text)
+        self.assertEqual("0=0.5;1=0.75;2=0.25", tilt.text)
 
     def test_face_angle_uses_requested_tilt_as_neutral_baseline(self) -> None:
         track = FaceTrack(
@@ -1213,7 +1315,7 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNotNone(effect)
         tilt = effect.find("./property[@name='filter.Tilt']")
         self.assertIsNotNone(tilt)
-        self.assertEqual("0=0.25;1=0.5;2=0.5", tilt.text)
+        self.assertEqual("0=0.25;1=0.5", tilt.text)
 
 
 class KeyframeDensityTests(unittest.TestCase):
